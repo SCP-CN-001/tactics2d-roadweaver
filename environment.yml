@@ -1,0 +1,42 @@
+# Road Weaver Conda Environment
+# Generated from the road-weaver environment (Python 3.9, CUDA 12.8)
+#
+# Create:  conda env create -f environment.yml
+# Update:  conda env update -f environment.yml
+#
+name: road-weaver
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.9
+  # GIS core
+  - osmnx>=1.5
+  - geopandas>=0.12
+  - shapely>=2.0
+  - pyproj>=3.3
+  - rtree>=1.0
+  - fiona>=1.9
+  - gdal>=3.4
+  # Data & viz
+  - matplotlib>=3.6
+  - pandas>=1.5
+  - numpy>=1.23
+  - scikit-learn>=1.0
+  - tqdm
+  - pillow>=9.0
+  - networkx>=2.8
+  # Misc
+  - pyyaml>=6.0
+  - pip
+  - pip:
+    # Deep learning (PyTorch stack)
+    - torch>=2.0
+    - torchvision>=0.15
+    - timm>=0.9
+    # Computer vision
+    - opencv-python>=4.7
+    # TF / Keras (needed by original model reproduction scripts)
+    - tensorflow>=2.15
+    # SafeTensors support
+    - safetensors>=0.4
