@@ -7,12 +7,11 @@ Public entry point: extract_all_priors()
 """
 
 import logging
-import math
 from typing import Any, Dict, List, Optional, Tuple
 
 import networkx as nx
 import numpy as np
-from shapely.geometry import LineString, Polygon, box
+from shapely.geometry import Polygon, box
 
 from src.urban_prior.block_utils import compute_block_prior, extract_blocks
 from src.urban_prior.graph_utils import (
@@ -21,7 +20,7 @@ from src.urban_prior.graph_utils import (
     METERS_PER_DEG_LAT,
     SKELETON_HIGHWAYS,
     build_graph_from_gdf,
-    compute_line_bearing_deg,
+    detect_roundabouts,
     estimate_lanes,
     estimate_width_m,
     find_boundary_nodes,
@@ -662,6 +661,12 @@ def extract_skeleton_graph(
             "estimated_lanes": estimate_lanes(hw),
             "estimated_width_m": estimate_width_m(hw),
         })
+
+    # Detect roundabouts and relabel nodes
+    roundabout_ids = detect_roundabouts(node_list, edge_list)
+    for n in node_list:
+        if n["id"] in roundabout_ids:
+            n["node_type"] = "roundabout"
 
     return {
         "nodes": node_list,

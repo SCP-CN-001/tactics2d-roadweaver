@@ -4,10 +4,9 @@
 Pipeline:
 1. Load style vectors from JSON.
 2. Match each patch to its OSM road network via manifest.json centroids.
-3. Clip roads to 2km bounding box.
-4. Extract global priors, skeleton graph, and block priors.
-5. Flatten into a single Parquet file with numeric columns + JSON string columns
-   for complex data (skeleton graph).
+3. Group patches by city, then process each city in parallel:
+   clip roads → extract priors → flatten.
+4. Write a single Parquet file with numeric columns + skeleton graph as JSON string.
 
 Usage:
     python -m src.urban_prior.build_dataset \
@@ -20,14 +19,13 @@ Usage:
 import argparse
 import json
 import logging
-import math
 import os
 import sys
 import time
-from collections import Counter
+from collections import defaultdict
+from multiprocessing import Pool
 from typing import Any, Dict, List, Optional
 
-import numpy as np
 import pandas as pd
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -44,97 +42,24 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description="Build Urban Structural Prior Dataset (Parquet output)"
     )
-    parser.add_argument(
-        "--style-json",
-        default="outputs/style_vectors.json",
-        help="Path to style_vectors.json",
-    )
-    parser.add_argument(
-        "--crhd-root",
-        default="data/crhd_2km_context_600x600",
-        help="CRHD image directory",
-    )
-    parser.add_argument(
-        "--graph-root",
-        default="data/osm",
-        help="Directory containing per-city GeoJSON road files",
-    )
-    parser.add_argument(
-        "--output",
-        default="data/urban_prior/urban_prior.parquet",
-        help="Output Parquet path",
-    )
+    parser.add_argument("--style-json", default="outputs/style_vectors.json")
+    parser.add_argument("--crhd-root", default="data/crhd_2km_context_600x600")
+    parser.add_argument("--graph-root", default="data/osm")
+    parser.add_argument("--output", default="data/urban_prior/urban_prior.parquet")
     parser.add_argument("--context-size-m", type=float, default=2000.0)
     parser.add_argument("--image-size", type=int, default=600)
-    parser.add_argument(
-        "--max-samples", type=int, default=-1,
-        help="Max samples to process (-1 = all)",
-    )
+    parser.add_argument("--max-samples", type=int, default=-1)
+    parser.add_argument("--num-workers", type=int, default=None,
+                        help="Worker processes (default: min(cpu_count, 16))")
     return parser.parse_args()
 
 
-def load_style_vectors(path: str) -> List[Dict]:
-    if not os.path.isfile(path):
-        logger.error("Style vectors file not found: %s", path)
-        sys.exit(1)
-    with open(path) as f:
-        data = json.load(f)
-    logger.info("Loaded %d style vector records", len(data))
-    return data
-
-
-def load_manifest(manifest_path: str) -> Dict[str, Dict]:
-    if not os.path.isfile(manifest_path):
-        logger.warning("Manifest not found: %s", manifest_path)
-        return {}
-    with open(manifest_path) as f:
-        manifest_list = json.load(f)
-    return {entry.get("source_path", ""): entry for entry in manifest_list}
+# ─── Module-level helpers (must be importable by worker processes) ────
 
 
 def extract_patch_id(image_path: str) -> Optional[str]:
-    basename = os.path.basename(image_path)
-    root, _ = os.path.splitext(basename)
+    root, _ = os.path.splitext(os.path.basename(image_path))
     return root
-
-
-def build_city_graph_cache(
-    graph_root: str,
-    style_records: List[Dict],
-    manifest_index: Dict[str, Dict],
-) -> tuple:
-    from src.urban_prior.graph_utils import load_city_geojson, build_city_name_map, patch_id_to_city
-
-    display_to_file, _ = build_city_name_map(graph_root)
-    logger.info("Found %d OSM GeoJSON files", len(display_to_file))
-
-    needed_cities = set()
-    patch_to_city = {}
-
-    for rec in style_records:
-        patch_id = extract_patch_id(rec.get("image_path", ""))
-        if not patch_id:
-            continue
-        city_from_manifest = manifest_index.get(patch_id, {}).get("city")
-        if city_from_manifest:
-            city_name = city_from_manifest
-        else:
-            city_name = patch_id_to_city(patch_id)
-        needed_cities.add(city_name)
-        patch_to_city[patch_id] = city_name
-
-    logger.info("Need data for %d unique cities", len(needed_cities))
-
-    cache = {}
-    for city_name in needed_cities:
-        if city_name in display_to_file:
-            gdf = load_city_geojson(display_to_file[city_name])
-            if gdf is not None and not gdf.empty:
-                cache[city_name] = gdf
-
-    logger.info("City graph cache: %d loaded, %d missing",
-                len(cache), len(needed_cities) - len(cache))
-    return cache, patch_to_city
 
 
 def _flatten_record(rec: Dict) -> Dict[str, Any]:
@@ -147,7 +72,7 @@ def _flatten_record(rec: Dict) -> Dict[str, Any]:
     quality = rec.get("quality", {}) or {}
     source = rec.get("source", {}) or {}
 
-    sv = condition.get("style_vector", [None] * 6) or [None] * 6
+    sv = (condition.get("style_vector") or [None] * 6)[:6]
     while len(sv) < 6:
         sv.append(None)
 
@@ -157,10 +82,7 @@ def _flatten_record(rec: Dict) -> Dict[str, Any]:
     out["top_pattern"] = condition.get("top_pattern")
     out["top_pattern_name"] = condition.get("top_pattern_name", "Unknown")
     out["confidence"] = condition.get("confidence")
-    out["context_size_m"] = condition.get("context_size_m")
-    out["meters_per_pixel"] = condition.get("meters_per_pixel")
 
-    # Global prior fields
     for k in [
         "road_density_km_per_km2", "major_road_density_km_per_km2",
         "minor_road_density_km_per_km2", "node_count", "edge_count",
@@ -173,7 +95,6 @@ def _flatten_record(rec: Dict) -> Dict[str, Any]:
     ]:
         out[k] = gp.get(k) if gp else None
 
-    # Block prior fields
     for k in [
         "block_count", "block_area_mean_m2", "block_area_std_m2",
         "block_area_median_m2", "block_aspect_ratio_mean",
@@ -182,27 +103,23 @@ def _flatten_record(rec: Dict) -> Dict[str, Any]:
         out[k] = bp.get(k) if bp else None
     out["block_prior_available"] = bool(bp.get("block_prior_available", False)) if bp else False
 
-    # Skeleton graph
     skeleton_nodes = sg.get("nodes", []) if sg else []
     skeleton_edges = sg.get("edges", []) if sg else []
     out["skeleton_node_count"] = len(skeleton_nodes)
     out["skeleton_edge_count"] = len(skeleton_edges)
     out["skeleton_graph_json"] = json.dumps({"nodes": skeleton_nodes, "edges": skeleton_edges})
 
-    # Quality
     out["quality_matched"] = bool(quality.get("matched", False)) if quality else False
     out["quality_valid_graph"] = bool(quality.get("valid_graph", False)) if quality else False
     out["quality_error"] = quality.get("error") or ""
 
-    # Source metadata
     out["crhd_image_path"] = source.get("crhd_image_path", "")
     out["graph_path"] = source.get("graph_path", "")
-
     return out
 
 
-def process_one_patch(rec, city_gdf, center_lat, center_lon,
-                      context_size_m, image_size, patch_id, crhd_root) -> Dict:
+def _process_one_patch(rec, city_gdf, center_lat, center_lon,
+                       context_size_m, image_size, patch_id, crhd_root) -> Dict:
     from src.urban_prior.graph_utils import clip_gdf_to_bbox, compute_bbox_latlon, patch_id_to_city
     from src.urban_prior.extractor import extract_all_priors
 
@@ -220,27 +137,23 @@ def process_one_patch(rec, city_gdf, center_lat, center_lon,
 
     priors = extract_all_priors(clipped_gdf, center_lat, center_lon, context_size_m)
 
-    style_vector = rec.get("style_vector", [])
-    meters_per_pixel = context_size_m / image_size
-
     condition = {
-        "style_vector": style_vector,
-        "style_dim": rec.get("style_dim", len(style_vector)),
+        "style_vector": rec.get("style_vector", []),
+        "style_dim": rec.get("style_dim", 0),
         "top_pattern": rec.get("top_pattern"),
         "top_pattern_name": rec.get("top_pattern_name"),
         "confidence": rec.get("confidence"),
         "context_size_m": context_size_m,
-        "meters_per_pixel": meters_per_pixel,
+        "meters_per_pixel": context_size_m / image_size,
     }
 
     graph_city_name = patch_id_to_city(patch_id)
-    graph_relative_path = os.path.join("data", "osm", f"{graph_city_name.replace(' ', '_')}.geojson")
-    crhd_relative = rec.get("image_path", os.path.join(crhd_root, f"{patch_id}.png"))
+    graph_rel = os.path.join("data", "osm", f"{graph_city_name.replace(' ', '_')}.geojson")
+    crhd_rel = rec.get("image_path", os.path.join(crhd_root, f"{patch_id}.png"))
 
     return {
         "patch_id": patch_id,
-        "source": {"crhd_image_path": crhd_relative, "graph_path": graph_relative_path,
-                    "style_source": os.path.basename(rec.get("_style_source", ""))},
+        "source": {"crhd_image_path": crhd_rel, "graph_path": graph_rel},
         "condition": condition,
         "global_prior": priors.get("global_prior", {}),
         "urban_skeleton_graph": priors.get("urban_skeleton_graph", {"nodes": [], "edges": []}),
@@ -251,6 +164,33 @@ def process_one_patch(rec, city_gdf, center_lat, center_lon,
             "error": priors["quality"]["error"],
         },
     }
+
+
+# ─── Worker function: process all patches for one city ────────────────
+
+
+def _worker_city(city_args: tuple) -> list:
+    """Process all patches belonging to one city.
+
+    city_args = (city_name, geojson_path, task_list, context_size_m, image_size, crhd_root)
+    task_list = [(rec, lat, lon, patch_id), ...]
+    """
+    city_name, geojson_path, tasks, ctx_m, img_sz, crhd_root = city_args
+
+    # Each worker loads the GeoJSON once for its assigned city
+    from src.urban_prior.graph_utils import load_city_geojson
+    gdf = load_city_geojson(geojson_path)
+    if gdf is None or gdf.empty:
+        return []
+
+    results = []
+    for rec, lat, lon, pid in tasks:
+        sample = _process_one_patch(rec, gdf, lat, lon, ctx_m, img_sz, pid, crhd_root)
+        results.append(_flatten_record(sample))
+    return results
+
+
+# ─── Main ─────────────────────────────────────────────────────────────
 
 
 def main():
@@ -269,9 +209,9 @@ def main():
     style_path = args.style_json
     if not os.path.isabs(style_path):
         style_path = os.path.join(project_root, style_path)
-    style_records = load_style_vectors(style_path)
-    for rec in style_records:
-        rec["_style_source"] = style_path
+    with open(style_path) as f:
+        style_records = json.load(f)
+    logger.info("Loaded %d style vector records", len(style_records))
 
     if args.max_samples > 0:
         style_records = style_records[:args.max_samples]
@@ -279,81 +219,94 @@ def main():
 
     # 2. Load manifest
     manifest_path = os.path.join(args.crhd_root, "manifest.json")
-    manifest_index = load_manifest(manifest_path)
+    if os.path.isfile(manifest_path):
+        with open(manifest_path) as f:
+            manifest_list = json.load(f)
+        manifest_index = {e.get("source_path", ""): e for e in manifest_list}
+    else:
+        manifest_index = {}
 
-    # 3. Build city graph cache
-    graph_root = os.path.join(project_root, args.graph_root) if not os.path.isabs(args.graph_root) else args.graph_root
-    city_cache, patch_to_city = build_city_graph_cache(graph_root, style_records, manifest_index)
+    # 3. Build per-city task lists
+    from src.urban_prior.graph_utils import build_city_name_map, patch_id_to_city
+    display_to_file, _ = build_city_name_map(args.graph_root)
+    logger.info("Found %d OSM GeoJSON files", len(display_to_file))
 
-    # 4. Process each patch
-    output_path = args.output if os.path.isabs(args.output) else os.path.join(project_root, args.output)
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
-
-    crhd_root = os.path.join(project_root, args.crhd_root) if not os.path.isabs(args.crhd_root) else args.crhd_root
-
-    records = []
+    city_tasks = defaultdict(list)  # city_name → [(rec, lat, lon, patch_id)]
     failed_count = 0
-    pattern_counter = Counter()
-    total = len(style_records)
-    t_start = time.time()
-
-    for i, rec in enumerate(style_records):
+    for rec in style_records:
         patch_id = extract_patch_id(rec.get("image_path", ""))
         if not patch_id:
             failed_count += 1
             continue
 
-        city_name = manifest_index.get(patch_id, {}).get("city") or patch_to_city.get(patch_id)
-        if not city_name:
-            failed_count += 1
-            continue
-
+        city_name = manifest_index.get(patch_id, {}).get("city") or patch_id_to_city(patch_id)
         cent = manifest_index.get(patch_id, {})
-        center_lat, center_lon = cent.get("lat"), cent.get("lon")
-        if center_lat is None or center_lon is None:
+        lat, lon = cent.get("lat"), cent.get("lon")
+        if not city_name or lat is None or lon is None:
+            failed_count += 1
+            continue
+        if city_name not in display_to_file:
             failed_count += 1
             continue
 
-        city_gdf = city_cache.get(city_name)
-        if city_gdf is None:
-            failed_count += 1
-            continue
+        city_tasks[city_name].append((rec, lat, lon, patch_id))
 
-        sample = process_one_patch(rec, city_gdf, center_lat, center_lon,
-                                    args.context_size_m, args.image_size, patch_id, crhd_root)
-        records.append(_flatten_record(sample))
+    logger.info("Assembled tasks for %d cities (%d patches, %d failed)",
+                len(city_tasks), sum(len(v) for v in city_tasks.values()), failed_count)
 
-        top_name = rec.get("top_pattern_name", "Unknown")
-        pattern_counter[top_name] += 1
+    crhd_root = args.crhd_root
+    if not os.path.isabs(crhd_root):
+        crhd_root = os.path.join(project_root, crhd_root)
 
-        if (i + 1) % 1000 == 0:
-            elapsed = time.time() - t_start
-            logger.info("Progress: %d/%d (%.1f%%) | %.1f samples/sec",
-                        i + 1, total, 100.0 * (i + 1) / total, (i + 1) / elapsed)
+    # 4. Dispatch per-city work to pool
+    pool_args = []
+    for city_name, tasks in city_tasks.items():
+        geojson_path = display_to_file[city_name]
+        pool_args.append((city_name, geojson_path, tasks,
+                          args.context_size_m, args.image_size, crhd_root))
+
+    num_workers = args.num_workers or min(os.cpu_count() or 4, 16)
+    logger.info("Processing %d cities with %d workers ...", len(pool_args), num_workers)
+
+    t_start = time.time()
+    all_records = []
+
+    with Pool(num_workers) as pool:
+        for i, chunk in enumerate(pool.imap_unordered(_worker_city, pool_args)):
+            all_records.extend(chunk)
+            if (i + 1) % 10 == 0 or i == len(pool_args) - 1:
+                elapsed = time.time() - t_start
+                logger.info("Progress: %d/%d cities (%.1f%%) | %.1f cities/min | %d records so far",
+                            i + 1, len(pool_args), 100.0 * (i + 1) / len(pool_args),
+                            (i + 1) / elapsed * 60, len(all_records))
 
     t_elapsed = time.time() - t_start
-    logger.info("Processing complete: %d records in %.1f seconds", len(records), t_elapsed)
+    logger.info("Processing complete: %d records in %.1f seconds (%.1f samples/sec)",
+                len(all_records), t_elapsed, len(all_records) / t_elapsed)
 
     # 5. Write Parquet
-    df = pd.DataFrame(records)
-    df.to_parquet(output_path, index=False)
-    logger.info("Dataset saved to: %s (%d rows, %d columns)",
-                output_path, len(df), len(df.columns))
+    output_path = args.output if os.path.isabs(args.output) else os.path.join(project_root, args.output)
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
-    # 6. Summary log
+    df = pd.DataFrame(all_records)
+    df.to_parquet(output_path, index=False)
+    logger.info("Dataset saved: %s (%d rows, %d cols, %.1f MB)",
+                output_path, len(df), len(df.columns),
+                os.path.getsize(output_path) / (1024 * 1024))
+
+    # 6. Summary
     valid_count = df["quality_valid_graph"].sum()
+    pattern_dist = df["top_pattern_name"].value_counts()
     logger.info("=" * 60)
     logger.info("BUILD COMPLETE")
     logger.info("=" * 60)
-    logger.info("Total style records: %d", total)
-    logger.info("Records in Parquet:  %d", len(records))
-    logger.info("Valid priors:        %d", valid_count)
-    logger.info("Failed records:      %d", failed_count)
-    logger.info("Pattern distribution:")
-    for pattern, count in pattern_counter.most_common():
-        logger.info("  %s: %d", pattern, count)
-    logger.info("Parquet file: %s (%.1f MB)",
-                output_path, os.path.getsize(output_path) / (1024 * 1024))
+    logger.info("Total:     %d", len(style_records))
+    logger.info("In Parquet: %d", len(all_records))
+    logger.info("Valid:     %d", valid_count)
+    logger.info("Failed:    %d", failed_count)
+    logger.info("Patterns:")
+    for p, c in pattern_dist.items():
+        logger.info("  %s: %d", p, c)
 
 
 if __name__ == "__main__":

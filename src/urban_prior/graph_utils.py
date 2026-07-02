@@ -17,7 +17,7 @@ import geopandas as gpd
 import networkx as nx
 import numpy as np
 import pandas as pd
-from shapely.geometry import LineString, Point, box
+from shapely.geometry import LineString, box
 
 logger = logging.getLogger(__name__)
 
@@ -494,3 +494,72 @@ def find_boundary_nodes(
             boundary_nodes.append(node)
 
     return boundary_nodes
+
+
+# ─── Roundabout detection ──────────────────────────────────────────
+
+
+def detect_roundabouts(skeleton_nodes: List[Dict], skeleton_edges: List[Dict]) -> set:
+    """Detect roundabout nodes via topological cycle analysis.
+
+    A roundabout is a small cycle where most nodes are degree-2 (the ring)
+    with some degree-3/4 nodes at entry/exit points, forming a compact
+    roughly-circular shape.
+
+    Args:
+        skeleton_nodes: List of node dicts from skeleton_graph_json.
+                        Each must have 'id', 'degree', 'x_m', 'y_m'.
+        skeleton_edges: List of edge dicts with 'source', 'target'.
+
+    Returns:
+        Set of node IDs belonging to detected roundabout cycles.
+    """
+    G = nx.Graph()
+    node_deg: Dict[int, int] = {}
+    node_xy: Dict[int, Tuple[float, float]] = {}
+
+    for n in skeleton_nodes:
+        nid = n["id"]
+        G.add_node(nid)
+        node_deg[nid] = n.get("degree", 0)
+        node_xy[nid] = (n.get("x_m", 0.0), n.get("y_m", 0.0))
+
+    for e in skeleton_edges:
+        G.add_edge(e["source"], e["target"])
+
+    try:
+        cycles = nx.cycle_basis(G)
+    except nx.NetworkXNoCycle:
+        return set()
+
+    roundabout_ids: set = set()
+
+    for cycle in cycles:
+        # Roundabouts are small cycles (3–12 nodes)
+        if len(cycle) < 3 or len(cycle) > 12:
+            continue
+
+        # Degree check: at least 40 % of nodes should be degree-2
+        degs = [node_deg.get(n, 0) for n in cycle]
+        deg2_count = sum(1 for d in degs if d == 2)
+        if deg2_count < len(cycle) * 0.4:
+            continue
+
+        # Spatial compactness: compute centroid and CV of distances
+        xs = [node_xy[n][0] for n in cycle]
+        ys = [node_xy[n][1] for n in cycle]
+        cx = sum(xs) / len(xs)
+        cy = sum(ys) / len(ys)
+        dists = [math.sqrt((x - cx) ** 2 + (y - cy) ** 2) for x, y in zip(xs, ys)]
+        mean_d = sum(dists) / len(dists)
+        if mean_d < 0.1:  # degenerate: all nodes at the same point
+            continue
+        var_d = sum((d - mean_d) ** 2 for d in dists) / len(dists)
+        std_d = math.sqrt(var_d)
+        cv = std_d / mean_d
+
+        # CV < 0.5 means nodes are roughly circular (not elongated / block-like)
+        if cv < 0.5:
+            roundabout_ids.update(cycle)
+
+    return roundabout_ids
