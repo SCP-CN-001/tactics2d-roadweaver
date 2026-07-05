@@ -4,6 +4,7 @@
 **/checkpoints/**
 **/data/**
 **/outputs/**
+**/runtimes/**
 **/wandb/**
 
 # Byte-compiled / optimized / DLL files
