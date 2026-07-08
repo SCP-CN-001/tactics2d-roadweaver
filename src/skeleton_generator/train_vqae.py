@@ -47,7 +47,10 @@ def parse_args():
     p.add_argument("--limit-train", type=int, default=None)
     p.add_argument("--limit-val", type=int, default=200)
     p.add_argument("--output-dir", type=str, default="runtimes/vq_vae")
-    p.add_argument("--wandb-project", type=str, default="roadweaver-ae")
+    p.add_argument("--wandb-project", type=str, default="roadweaver-ae",
+                   help="Wandb project name. Empty string = no logging.")
+    p.add_argument("--num-codes", type=int, default=512,
+                   help="Number of VQ codebook entries")
     return p.parse_args()
 
 
@@ -62,7 +65,7 @@ def main():
     val_loader = make_field_dataloader("val", batch_size=args.batch_size, shuffle=False,
         num_workers=args.num_workers, limit_samples=args.limit_val, resolution=RESOLUTION)
 
-    model = VQVAE(resolution=RESOLUTION).to(device)
+    model = VQVAE(resolution=RESOLUTION, num_codes=args.num_codes).to(device)
     print(f"[VQ-VAE] Code map: {model.code_map_hw}×{model.code_map_hw}, codebook: {model.num_codes}×{model.embed_dim}")
     print(f"  Params: {sum(p.numel() for p in model.parameters()):,}")
 

@@ -7,10 +7,10 @@ Predicts masked code tokens in a 32×32 code map given:
   - 11-dim condition (style + structural priors)
 
 Architecture:
-  token embed (256 + 1 MASK) → learned pos embed (1024)
+  token embed (512 + 1 MASK) → learned pos embed (1024)
   + condition embed (via MLP, broadcast)
   → Transformer encoder (6 layers, 8 heads, 512 dim)
-  → linear head → logits (257)
+  → linear head → logits (513)
 
 Training: masked language modeling (random mask, predict masked only).
 Inference: start from all-MASK, iteratively unmask high-confidence tokens.
@@ -84,9 +84,9 @@ class MaskedCodeModel(nn.Module):
         cond_dim: raw condition dimension (11)
     """
 
-    MASK_TOKEN_ID = 256  # reserved MASK token ID
+    MASK_TOKEN_ID = 512  # reserved MASK token ID (num_codes, since codes 0-511)
 
-    def __init__(self, vocab_size: int = 257, d_model: int = 512,
+    def __init__(self, vocab_size: int = 513, d_model: int = 512,
                  nhead: int = 8, num_layers: int = 6, cond_dim: int = 11,
                  max_seq_len: int = 1024):
         super().__init__()

@@ -8,7 +8,7 @@ Usage:
     # Precompute code maps first (if not cached)
     # Then train:
     PYTHONPATH=src:$PYTHONPATH conda run -n road-weaver \
-        python -m src.spatial_conditional_skeleton_generator.train_masked_code_transformer
+        python -m src.skeleton_generator.train_masked_code_transformer
 """
 
 import argparse
@@ -73,7 +73,8 @@ def extract_code_maps(vq, loader, device, max_samples=None):
     return codes.numpy(), conds.numpy()
 
 
-def mask_tokens(code_tokens, mask_token_id=256, min_mask=0.10, max_mask=0.90):
+def mask_tokens(code_tokens, mask_token_id=MaskedCodeModel.MASK_TOKEN_ID,
+                min_mask=0.10, max_mask=0.90):
     """Randomly mask tokens with per-batch variable ratio.
 
     Each batch gets a random mask ratio sampled uniformly from [min_mask, max_mask].
@@ -104,7 +105,7 @@ def mask_tokens(code_tokens, mask_token_id=256, min_mask=0.10, max_mask=0.90):
 
 def parse_args():
     p = argparse.ArgumentParser(description="Masked Code Transformer Training")
-    p.add_argument("--vq-checkpoint", default="runtimes/vq_vae/checkpoints/best.pth")
+    p.add_argument("--vq-checkpoint", default="checkpoints/skeleton_generator/vq_vae.pth")
     p.add_argument("--cache-dir", default="cache/masked_code_maps",
                    help="Directory for precomputed code map cache")
     p.add_argument("--epochs", type=int, default=50)
@@ -119,7 +120,10 @@ def parse_args():
     p.add_argument("--d-model", type=int, default=512)
     p.add_argument("--num-layers", type=int, default=6)
     p.add_argument("--num-heads", type=int, default=8)
-    p.add_argument("--wandb-project", type=str, default="roadweaver-ae")
+    p.add_argument("--wandb-project", type=str, default="roadweaver-ae",
+                   help="Wandb project name. Empty string = no logging.")
+    p.add_argument("--num-codes", type=int, default=512,
+                   help="Number of codes (vocab_size = num_codes + 1)")
     return p.parse_args()
 
 
@@ -134,7 +138,7 @@ def main():
 
     # ── Frozen VQVAE ──
     print("[Train] Loading frozen VQVAE...")
-    vq = VQVAE(resolution=RESOLUTION).to(device)
+    vq = VQVAE(resolution=RESOLUTION, num_codes=args.num_codes).to(device)
     vq.eval()
     for p in vq.parameters():
         p.requires_grad = False
@@ -186,7 +190,8 @@ def main():
                             num_workers=args.num_workers, pin_memory=True)
 
     # ── Model ──
-    model = MaskedCodeModel(d_model=args.d_model, num_layers=args.num_layers,
+    model = MaskedCodeModel(vocab_size=args.num_codes + 1,
+                            d_model=args.d_model, num_layers=args.num_layers,
                             nhead=args.num_heads).to(device)
     print(f"[Train] Params: {sum(p.numel() for p in model.parameters()):,}")
     print(f"  Transformer: {args.num_layers} layers, {args.num_heads} heads, {args.d_model} dim")
@@ -220,7 +225,7 @@ def main():
 
             # Loss on masked positions only
             loss = F.cross_entropy(
-                logits.view(-1, 257), labels.view(-1), ignore_index=-100)
+                logits.view(-1, model.vocab_size), labels.view(-1), ignore_index=-100)
 
             opt.zero_grad(set_to_none=True)
             loss.backward()
@@ -251,7 +256,7 @@ def main():
 
                 logits = model(masked_codes, mask, cond)
                 loss = F.cross_entropy(
-                    logits.view(-1, 257), labels.view(-1), ignore_index=-100)
+                    logits.view(-1, model.vocab_size), labels.view(-1), ignore_index=-100)
 
                 val_ce += loss.item() * mask.sum().item()
                 val_tokens += mask.sum().item()
