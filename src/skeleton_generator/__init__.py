@@ -25,10 +25,12 @@ from .bfs_ordering import BFSOrdering
 from .vq_vae import VQVAE, VectorQuantizer
 from .masked_transformer import MaskedCodeModel
 from .anchor_sampler import AnchorGenerator, AnchorSampler
+from .endpoint_connector import EndpointConnector
 
 __all__ = [
     "CONFIG", "PATTERN_NAMES",
     "BFSOrdering",
     "VQVAE", "VectorQuantizer",
     "MaskedCodeModel", "AnchorGenerator", "AnchorSampler",
+    "EndpointConnector",
 ]

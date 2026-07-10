@@ -22,7 +22,7 @@ from torch import nn
 
 from .masked_transformer import MaskedCodeModel
 from .vq_vae import VQVAE
-from .skeleton_dataset import RESOLUTION
+from .config import CONFIG
 
 
 class AnchorSampler:
@@ -171,7 +171,9 @@ class AnchorGenerator(nn.Module):
                  cluster_cache_path: Optional[str] = "cache/anchor_clusters",
                  device: str = "cuda",
                  d_model: int = 256, num_layers: int = 4, nhead: int = 4,
-                 num_codes: int = 512):
+                 num_codes: int = 512,
+                 resolution: Optional[int] = None,
+                 code_map_size: Optional[int] = None):
         super().__init__()
         self.device = device
         self.d_model = d_model
@@ -179,8 +181,13 @@ class AnchorGenerator(nn.Module):
         self.nhead = nhead
         self.num_codes = num_codes
 
+        # Resolution: default to CONFIG, override with explicit param
+        self.resolution = resolution if resolution is not None else CONFIG.resolution
+        self.code_map_size = code_map_size if code_map_size is not None else CONFIG.code_map_size
+
         # VQ decoder
-        self.vq = VQVAE(resolution=RESOLUTION, num_codes=num_codes).to(device)
+        self.vq = VQVAE(resolution=self.resolution, num_codes=num_codes,
+                        code_map_size=self.code_map_size).to(device)
         self.vq.eval()
         for p in self.vq.parameters():
             p.requires_grad = False
@@ -192,10 +199,12 @@ class AnchorGenerator(nn.Module):
         self.vq.load_state_dict(vs, strict=False)
 
         # Masked code model
+        code_map_hw = self.resolution // (4 if self.code_map_size == 32 else 2)
         self.model = MaskedCodeModel(vocab_size=num_codes + 1,
                                       d_model=self.d_model,
                                       num_layers=self.num_layers,
-                                      nhead=self.nhead).to(device)
+                                      nhead=self.nhead,
+                                      max_seq_len=code_map_hw * code_map_hw).to(device)
         self.model.eval()
         for p in self.model.parameters():
             p.requires_grad = False
@@ -385,9 +394,10 @@ class AnchorGenerator(nn.Module):
 
         graph = field_to_graph(
             road, junct, endpt, road_threshold=0.10,
-            resolution=RESOLUTION, prune_short_branches=True,
+            resolution=self.resolution, prune_short_branches=True,
             cleanup=True, opening_radius=opening_r, closing_radius=closing_r,
             min_edge_len=0.004 if density < 20 else 0.008,
+            keep_all_nodes=True,  # let graph_refiner handle simplification
         )
 
         return {

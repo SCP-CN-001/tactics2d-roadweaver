@@ -48,6 +48,12 @@ class GeneratorConfig:
     map_size_scale: float = 2000.0
     """Used to normalise map_size before feeding into condition encoder."""
 
+    resolution: int = 128
+    """Raster field resolution in pixels (128 for 2km, 256 for 5km)."""
+
+    code_map_size: int = 32
+    """VQ code map size (32 for 4× down, 64 for 2× down)."""
+
     style_dim: int = 6
     """Dimension of the style vector."""
 

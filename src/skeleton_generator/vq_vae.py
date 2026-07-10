@@ -148,32 +148,64 @@ class VectorQuantizer(nn.Module):
 class VQVAE(nn.Module):
     def __init__(self, in_ch: int = 6, embed_dim: int = 64, num_codes: int = 512,
                  resolution: int = 128, commitment_cost: float = 0.25,
-                 decay: float = 0.99):
+                 decay: float = 0.99, code_map_size: int = 32):
+        """
+        Args:
+            in_ch: input channels (6).
+            embed_dim: code embedding dimension.
+            num_codes: number of discrete codes.
+            resolution: field resolution (128).
+            commitment_cost: VQ commitment loss weight.
+            decay: EMA decay for codebook update.
+            code_map_size: 32 (current, 4× down) or 64 (ablation, 2× down).
+        """
         super().__init__()
         self.embed_dim = embed_dim
         self.num_codes = num_codes
-        self.code_map_hw = resolution // 4
+        self.code_map_size = code_map_size
+        self.code_map_hw = resolution // (4 if code_map_size == 32 else 2)
         self.resolution = resolution
 
-        self.encoder = nn.Sequential(
-            nn.Conv2d(in_ch, 32, 3, stride=2, padding=1),
-            nn.BatchNorm2d(32), nn.ReLU(inplace=True), ResBlock(32),
-            nn.Conv2d(32, 64, 3, stride=2, padding=1),
-            nn.BatchNorm2d(64), nn.ReLU(inplace=True), ResBlock(64),
-            nn.Conv2d(64, embed_dim, 3, padding=1),
-            nn.BatchNorm2d(embed_dim), nn.ReLU(inplace=True), ResBlock(embed_dim),
-        )
+        # ── Encoder ──
+        if code_map_size == 32:
+            # Current: 128→64→32 (2× stride-2)
+            self.encoder = nn.Sequential(
+                nn.Conv2d(in_ch, 32, 3, stride=2, padding=1),
+                nn.BatchNorm2d(32), nn.ReLU(inplace=True), ResBlock(32),
+                nn.Conv2d(32, 64, 3, stride=2, padding=1),
+                nn.BatchNorm2d(64), nn.ReLU(inplace=True), ResBlock(64),
+                nn.Conv2d(64, embed_dim, 3, padding=1),
+                nn.BatchNorm2d(embed_dim), nn.ReLU(inplace=True), ResBlock(embed_dim),
+            )
+            # Decoder: 32→64→128 (2× stride-2 tconv)
+            self.decoder = nn.Sequential(
+                nn.ConvTranspose2d(embed_dim, 64, 4, stride=2, padding=1),
+                nn.BatchNorm2d(64), nn.ReLU(inplace=True), ResBlock(64),
+                nn.ConvTranspose2d(64, 16, 4, stride=2, padding=1),
+                nn.BatchNorm2d(16), nn.ReLU(inplace=True), ResBlock(16),
+            )
+        else:
+            # 64×64 code map: 128→64 (1× stride-2), more depth at 64×64
+            self.encoder = nn.Sequential(
+                nn.Conv2d(in_ch, 24, 3, stride=2, padding=1),
+                nn.BatchNorm2d(24), nn.ReLU(inplace=True), ResBlock(24),
+                nn.Conv2d(24, 48, 3, stride=1, padding=1),
+                nn.BatchNorm2d(48), nn.ReLU(inplace=True), ResBlock(48), ResBlock(48),
+                nn.Conv2d(48, embed_dim, 3, padding=1),
+                nn.BatchNorm2d(embed_dim), nn.ReLU(inplace=True), ResBlock(embed_dim),
+            )
+            # Decoder: 64→128 (1× stride-2 tconv)
+            self.decoder = nn.Sequential(
+                nn.ConvTranspose2d(embed_dim, 48, 4, stride=2, padding=1),
+                nn.BatchNorm2d(48), nn.ReLU(inplace=True), ResBlock(48), ResBlock(48),
+                nn.ConvTranspose2d(48, 16, 3, stride=1, padding=1),
+                nn.BatchNorm2d(16), nn.ReLU(inplace=True), ResBlock(16),
+            )
 
         self.quantizer = VectorQuantizer(
             num_embeddings=num_codes, embedding_dim=embed_dim,
             commitment_cost=commitment_cost, decay=decay)
 
-        self.decoder = nn.Sequential(
-            nn.ConvTranspose2d(embed_dim, 64, 4, stride=2, padding=1),
-            nn.BatchNorm2d(64), nn.ReLU(inplace=True), ResBlock(64),
-            nn.ConvTranspose2d(64, 16, 4, stride=2, padding=1),
-            nn.BatchNorm2d(16), nn.ReLU(inplace=True), ResBlock(16),
-        )
         self.coord_conv = nn.Conv2d(2, 16, 3, padding=1)
         self.out_conv = nn.Sequential(
             nn.Conv2d(16 + 16, 32, 3, padding=1), nn.ReLU(inplace=True),
@@ -202,8 +234,6 @@ class VQVAE(nn.Module):
 
     def forward(self, field: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, dict]:
         z_e = self.encoder(field)
-        # Run quantizer in full precision to avoid AMP dtype mismatch
-        # with codebook embeddings (float32) vs encoder output (float16)
         with torch.cuda.amp.autocast(enabled=False):
             z_q, indices, info = self.quantizer(z_e.float())
         return self.decode(z_q.to(z_e.dtype)), indices, info

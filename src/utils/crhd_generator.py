@@ -7,7 +7,7 @@ polygon projection path in osmnx's graph_from_point.
 import math
 import os
 import sys
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 import matplotlib.pyplot as plt
 import osmnx as ox
@@ -478,6 +478,7 @@ def download_osm_cache(
     cache_dir: str,
     osm_dir: Optional[str] = None,
     city_limit: Optional[int] = None,
+    city_names: Optional[List[str]] = None,
 ):
     """Phase 1: download OSM road networks and cache as GeoJSON.
 
@@ -486,12 +487,19 @@ def download_osm_cache(
     already have a file in *osm_dir* (or in *cache_dir* if *osm_dir* is
     not set).
 
+    When *city_names* is provided (e.g. from parquet), it is used directly
+    instead of reading from *input_dir* (which may be None).  In this mode,
+    a fallback bbox of ±0.15° (~15km) around a geocoded center is used
+    instead of reading grid shapefiles.
+
     Args:
-        input_dir: Directory containing classified grid shapefiles.
+        input_dir: Directory containing classified grid shapefiles (may be None
+            if city_names is given).
         cache_dir: Temporary directory for GeoJSON cache.
         osm_dir: Permanent directory for verified GeoJSON files.  When set,
             cached files are moved here after successful verification.
         city_limit: Max cities to process (default: all).
+        city_names: Optional list of city names (bypasses input_dir).
     """
     import geopandas as gpd
     import shutil
@@ -500,13 +508,16 @@ def download_osm_cache(
     if osm_dir:
         os.makedirs(osm_dir, exist_ok=True)
 
-    city_dirs = sorted([
-        d for d in os.listdir(input_dir)
-        if os.path.isdir(os.path.join(input_dir, d))
-    ])
+    # Determine city list
+    if city_names is not None:
+        city_dirs = city_names
+    else:
+        city_dirs = sorted([
+            d for d in os.listdir(input_dir)
+            if os.path.isdir(os.path.join(input_dir, d))
+        ])
 
-    # When osm_dir is set, pre-filter to only cities not already there.
-    # This way city_limit only counts cities that actually need downloading.
+    # Pre-filter to cities not yet in osm_dir
     if osm_dir:
         filtered = []
         for city in city_dirs:
@@ -522,14 +533,6 @@ def download_osm_cache(
             city_dirs = city_dirs[:city_limit]
 
     for city_idx, city in enumerate(city_dirs):
-
-        shp_files = [
-            f for f in os.listdir(os.path.join(input_dir, city))
-            if f.endswith('.shp')
-        ]
-        if not shp_files:
-            continue
-
         safe = _sanitize_city_name(city)
 
         # Skip if already in the permanent osm dir
@@ -539,9 +542,9 @@ def download_osm_cache(
                 print(f'[{city}] already in osm/, skip')
                 continue
 
+        # Check/verify cache
         cache_path = os.path.join(cache_dir, f'{safe}.geojson')
         if os.path.exists(cache_path):
-            # Cache exists but hasn't been moved yet — verify and move
             print(f'[{city}] cached, verifying ...', end=' ', flush=True)
             if _verify_geojson(cache_path):
                 if osm_dir:
@@ -554,10 +557,31 @@ def download_osm_cache(
                 os.remove(cache_path)
             continue
 
-        gdf_grid = gpd.read_file(os.path.join(input_dir, city, shp_files[0]))
-        bounds = gdf_grid.total_bounds
-        print(f'[{city}] {len(gdf_grid)} cells, bounds={bounds.round(3).tolist()}',
-              end=' ', flush=True)
+        # Determine download bounds
+        if city_names is not None:
+            # From parquet: use geocoded bounding box
+            print(f'[{city}] geocoding ...', end=' ', flush=True)
+            try:
+                import osmnx as ox_gc
+                g = ox_gc.geocode(city)
+                lat, lon = g[0], g[1] if len(g) == 2 else (g[1], g[0])
+                bounds = (lon - 0.15, lat - 0.15, lon + 0.15, lat + 0.15)
+            except Exception as e:
+                print(f'geocode FAILED: {e}')
+                continue
+            print(f'bounds={[round(b,3) for b in bounds]}', end=' ', flush=True)
+        else:
+            # From shapefiles: read grid boundaries
+            shp_files = [
+                f for f in os.listdir(os.path.join(input_dir, city))
+                if f.endswith('.shp')
+            ]
+            if not shp_files:
+                continue
+            gdf_grid = gpd.read_file(os.path.join(input_dir, city, shp_files[0]))
+            bounds = gdf_grid.total_bounds
+            print(f'[{city}] {len(gdf_grid)} cells, bounds={bounds.round(3).tolist()}',
+                  end=' ', flush=True)
 
         gdf_roads = _download_city_roads_adaptive(bounds)
         if gdf_roads is None:
@@ -811,8 +835,10 @@ def main():
                         help='Download OSM roads only (no render)')
     parser.add_argument('--render-only', action='store_true',
                         help='Render CRHDs from existing OSM GeoJSON only')
-    parser.add_argument('--input', type=str, required=True,
+    parser.add_argument('--input', type=str, default=None,
                         help='Directory of classified grid shapefiles')
+    parser.add_argument('--parquet-path', type=str, default=None,
+                        help='Urban prior parquet for city list (replaces --input in download-only mode)')
     parser.add_argument('--cache', type=str, default='./data/osm_cache',
                         help='Temp dir for OSM downloads (default: ./data/osm_cache)')
     parser.add_argument('--osm-dir', type=str, default='./data/osm',
@@ -839,7 +865,21 @@ def main():
                              '0 = clip to cell boundary (default).')
     args = parser.parse_args()
 
-    if not os.path.isdir(args.input):
+    # Resolve city source for download-only mode
+    city_names_from_parquet = None
+    if args.download_only:
+        if args.parquet_path:
+            # Read city names from parquet (no shapefiles needed)
+            import pandas as _pd
+            _df = _pd.read_parquet(args.parquet_path)
+            city_names_from_parquet = sorted(set(
+                pid.rsplit('_', 1)[0] for pid in _df['patch_id'] if '_' in pid
+            ))
+        elif not args.input or not os.path.isdir(args.input):
+            print(f'[error] Either --input (shapefiles) or --parquet-path is required.',
+                  file=sys.stderr)
+
+    if args.input and not os.path.isdir(args.input):
         print(f'[error] Input directory not found: {args.input}', file=sys.stderr)
         sys.exit(1)
 
@@ -852,6 +892,7 @@ def main():
             cache_dir=args.cache,
             osm_dir=args.osm_dir,
             city_limit=args.city_limit,
+            city_names=city_names_from_parquet,
         )
         return
 

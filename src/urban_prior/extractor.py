@@ -7,6 +7,7 @@ Public entry point: extract_all_priors()
 """
 
 import logging
+import math
 from typing import Any, Dict, List, Optional, Tuple
 
 import networkx as nx
@@ -746,6 +747,7 @@ def extract_all_priors(
     center_lat: float,
     center_lon: float,
     context_size_m: float,
+    include_tertiary: bool = False,
 ) -> Dict[str, Any]:
     """Extract all urban structural priors from a clipped road network.
 
@@ -799,13 +801,12 @@ def extract_all_priors(
 
     # ── Urban skeleton graph ───────────────────────────────────────
     try:
-        # First try without tertiary
         skeleton = extract_skeleton_graph(
             graph, gdf, center_lat, center_lon, context_size_m,
-            include_tertiary=False,
+            include_tertiary=include_tertiary,
         )
-        # If too sparse, try with tertiary
-        if skeleton["skeleton_edge_count"] < 3:
+        # Fallback: if explicitly asked to exclude tertiary but too sparse, try with
+        if not include_tertiary and skeleton["skeleton_edge_count"] < 3:
             skeleton = extract_skeleton_graph(
                 graph, gdf, center_lat, center_lon, context_size_m,
                 include_tertiary=True,

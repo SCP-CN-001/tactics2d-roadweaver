@@ -51,6 +51,8 @@ def parse_args():
     parser.add_argument("--max-samples", type=int, default=-1)
     parser.add_argument("--num-workers", type=int, default=None,
                         help="Worker processes (default: min(cpu_count, 16))")
+    parser.add_argument("--include-tertiary", action="store_true",
+                        help="Include tertiary roads in skeleton graph (default: fallback only)")
     return parser.parse_args()
 
 
@@ -119,7 +121,8 @@ def _flatten_record(rec: Dict) -> Dict[str, Any]:
 
 
 def _process_one_patch(rec, city_gdf, center_lat, center_lon,
-                       context_size_m, image_size, patch_id, crhd_root) -> Dict:
+                       context_size_m, image_size, patch_id, crhd_root,
+                       include_tertiary=False) -> Dict:
     from src.urban_prior.graph_utils import clip_gdf_to_bbox, compute_bbox_latlon, patch_id_to_city
     from src.urban_prior.extractor import extract_all_priors
 
@@ -135,7 +138,8 @@ def _process_one_patch(rec, city_gdf, center_lat, center_lon,
                 "quality": {"matched": True, "valid_graph": False,
                             "error": "No roads in patch bounding box"}}
 
-    priors = extract_all_priors(clipped_gdf, center_lat, center_lon, context_size_m)
+    priors = extract_all_priors(clipped_gdf, center_lat, center_lon, context_size_m,
+                                include_tertiary=include_tertiary)
 
     condition = {
         "style_vector": rec.get("style_vector", []),
@@ -172,10 +176,10 @@ def _process_one_patch(rec, city_gdf, center_lat, center_lon,
 def _worker_city(city_args: tuple) -> list:
     """Process all patches belonging to one city.
 
-    city_args = (city_name, geojson_path, task_list, context_size_m, image_size, crhd_root)
+    city_args = (city_name, geojson_path, task_list, context_size_m, image_size, crhd_root, include_tertiary)
     task_list = [(rec, lat, lon, patch_id), ...]
     """
-    city_name, geojson_path, tasks, ctx_m, img_sz, crhd_root = city_args
+    city_name, geojson_path, tasks, ctx_m, img_sz, crhd_root, incl_tert = city_args
 
     # Each worker loads the GeoJSON once for its assigned city
     from src.urban_prior.graph_utils import load_city_geojson
@@ -185,7 +189,8 @@ def _worker_city(city_args: tuple) -> list:
 
     results = []
     for rec, lat, lon, pid in tasks:
-        sample = _process_one_patch(rec, gdf, lat, lon, ctx_m, img_sz, pid, crhd_root)
+        sample = _process_one_patch(rec, gdf, lat, lon, ctx_m, img_sz, pid, crhd_root,
+                                     include_tertiary=incl_tert)
         results.append(_flatten_record(sample))
     return results
 
@@ -263,7 +268,8 @@ def main():
     for city_name, tasks in city_tasks.items():
         geojson_path = display_to_file[city_name]
         pool_args.append((city_name, geojson_path, tasks,
-                          args.context_size_m, args.image_size, crhd_root))
+                          args.context_size_m, args.image_size, crhd_root,
+                          args.include_tertiary))
 
     num_workers = args.num_workers or min(os.cpu_count() or 4, 16)
     logger.info("Processing %d cities with %d workers ...", len(pool_args), num_workers)

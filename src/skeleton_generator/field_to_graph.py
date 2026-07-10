@@ -20,18 +20,21 @@ def field_to_graph(
     cleanup: bool = True,
     opening_radius: int = 2,
     closing_radius: int = 2,
+    keep_all_nodes: bool = True,
 ) -> Dict:
     """
-    Convert a binary road mask to a simplified skeleton graph.
+    Convert a binary road mask to a skeleton graph.
 
     For binary centerline fields (recommended): use binary_center directly.
     For soft fields: threshold road_prob.
 
-    Morphological cleanup (opening + closing) removes speckle noise that
-    would otherwise be skeletonized into hundreds of spurious nodes.
+    When *keep_all_nodes* is True (default), every skeleton pixel becomes a
+    graph node and all 8-connected edges are kept; no degree-2 simplification
+    is performed.  The caller (e.g. ``graph_refiner``) handles simplification.
+    This gives the refiner full freedom to decide how to merge and reconnect.
 
-    Post-processing: keeps largest CC, prunes short dead-end branches,
-    simplifies degree-2 chains.
+    When *keep_all_nodes* is False, the function performs the legacy
+    junction-only simplification (paths between junctions become single edges).
     """
     from skimage.morphology import dilation, square, remove_small_objects, remove_small_holes
     from scipy.ndimage import binary_opening, binary_closing
@@ -78,12 +81,38 @@ def field_to_graph(
         return {"coords": np.zeros((0, 2)), "edge_index": np.zeros((0, 2), dtype=np.int64),
                 "node_types": np.zeros(0, dtype=np.int64)}
 
-    # Keep only largest connected component
+    # ── keep_all_nodes mode: output ALL skeleton CCs, let refiner connect them ──
+    if keep_all_nodes:
+        node_list = list(G.nodes())
+        id_map = {old: new for new, old in enumerate(node_list)}
+        deg_dict = dict(G.degree())
+        out_nodes = []
+        out_types = []
+        for old_id in node_list:
+            r, c = skel_coords[old_id]
+            out_nodes.append([c / resolution, r / resolution])
+            d = deg_dict.get(old_id, 2)
+            if d == 1:
+                out_types.append(4)   # dead-end / endpoint
+            elif d == 2:
+                out_types.append(0)   # skeleton waypoint
+            else:
+                out_types.append(1)   # junction
+
+        out_edges = []
+        for u, v in G.edges():
+            out_edges.append([id_map[u], id_map[v]])
+
+        return {
+            "coords": np.array(out_nodes, dtype=np.float32),
+            "edge_index": np.array(out_edges, dtype=np.int64) if out_edges else np.zeros((0, 2), dtype=np.int64),
+            "node_types": np.array(out_types, dtype=np.int64),
+        }
+
+    # ── Legacy mode: keep only largest connected component ──
     components = list(nx.connected_components(G))
     largest = max(components, key=len)
     G = G.subgraph(largest).copy()
-
-    # Junction/endpoint identification
     deg_dict = dict(G.degree())
     junction_set = {n for n, d in deg_dict.items() if d != 2}
     if not junction_set:

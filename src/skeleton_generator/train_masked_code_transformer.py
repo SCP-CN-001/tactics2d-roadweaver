@@ -23,9 +23,9 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 
+from .config import CONFIG
 from .vq_vae import VQVAE
 from .masked_transformer import MaskedCodeModel
-from .skeleton_dataset import make_field_dataloader, RESOLUTION
 
 
 class CachedCodeMapDataset(Dataset):
@@ -34,9 +34,10 @@ class CachedCodeMapDataset(Dataset):
     def __init__(self, cache_path: str):
         import numpy as np
         data = np.load(cache_path)
-        self.code_maps = torch.from_numpy(data["code_maps"])  # (N, 1024)
+        self.code_maps = torch.from_numpy(data["code_maps"])  # (N, S)
         self.conditions = torch.from_numpy(data["conditions"])  # (N, 11)
-        print(f"  Loaded {len(self.code_maps)} samples from {cache_path}")
+        print(f"  Loaded {len(self.code_maps)} samples from {cache_path}"
+              f" (code dim: {self.code_maps.shape[-1]})")
 
     def __len__(self):
         return len(self.code_maps)
@@ -49,7 +50,7 @@ class CachedCodeMapDataset(Dataset):
 
 
 @torch.no_grad()
-def extract_code_maps(vq, loader, device, max_samples=None):
+def extract_code_maps(vq, loader, device, max_samples=None, code_map_hw=32):
     """Extract code maps and conditions from a dataloader."""
     all_codes, all_conds = [], []
     count = 0
@@ -59,8 +60,8 @@ def extract_code_maps(vq, loader, device, max_samples=None):
         struct = batch["structural_priors"]
         cond = torch.cat([style, struct], dim=1)
 
-        _, indices = vq.encode_to_code(field)  # (B, 32, 32)
-        indices = indices.cpu().reshape(-1, 1024)  # (B, 1024)
+        _, indices = vq.encode_to_code(field)  # (B, code_map_hw, code_map_hw)
+        indices = indices.cpu().reshape(-1, code_map_hw * code_map_hw)  # (B, S)
 
         all_codes.append(indices)
         all_conds.append(cond)
@@ -124,13 +125,35 @@ def parse_args():
                    help="Wandb project name. Empty string = no logging.")
     p.add_argument("--num-codes", type=int, default=512,
                    help="Number of codes (vocab_size = num_codes + 1)")
+    p.add_argument("--resolution", type=int, default=128,
+                   help="Raster field resolution (128 for 2km, 256 for 5km)")
+    p.add_argument("--code-map-size", type=int, default=32, choices=[32, 64],
+                   help="VQ code map size (must match VQ-VAE checkpoint)")
+    p.add_argument("--map-size", type=float, default=2000.0,
+                   help="Map size in meters")
+    p.add_argument("--data-dir", type=str, default=None,
+                   help="Override data split directory")
     return p.parse_args()
 
 
 def main():
     args = parse_args()
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    # Apply config overrides from CLI
+    CONFIG.resolution = args.resolution
+    CONFIG.code_map_size = args.code_map_size
+    CONFIG.map_size_scale = args.map_size
+    if args.data_dir:
+        CONFIG.train_split_path = os.path.join(args.data_dir, "train.parquet")
+        CONFIG.val_split_path = os.path.join(args.data_dir, "val.parquet")
+
+    from .skeleton_dataset import make_field_dataloader  # delayed import
+    resolution = CONFIG.resolution
+    code_map_hw = resolution // (4 if args.code_map_size == 32 else 2)
+    seq_len = code_map_hw * code_map_hw
+
     args.limit_train = args.limit_train if args.limit_train > 0 else None
+    device = "cuda" if torch.cuda.is_available() else "cpu"
 
     os.makedirs(args.output_dir, exist_ok=True)
     os.makedirs(os.path.join(args.output_dir, "checkpoints"), exist_ok=True)
@@ -138,7 +161,8 @@ def main():
 
     # ── Frozen VQVAE ──
     print("[Train] Loading frozen VQVAE...")
-    vq = VQVAE(resolution=RESOLUTION, num_codes=args.num_codes).to(device)
+    vq = VQVAE(resolution=resolution, num_codes=args.num_codes,
+               code_map_size=args.code_map_size).to(device)
     vq.eval()
     for p in vq.parameters():
         p.requires_grad = False
@@ -162,18 +186,20 @@ def main():
         train_loader = make_field_dataloader(
             "train", batch_size=64, shuffle=False,
             num_workers=args.num_workers, limit_samples=args.limit_train,
-            resolution=RESOLUTION,
+            resolution=resolution,
         )
         val_loader = make_field_dataloader(
             "val", batch_size=64, shuffle=False,
             num_workers=args.num_workers, limit_samples=args.limit_val,
-            resolution=RESOLUTION,
+            resolution=resolution,
         )
 
-        train_codes, train_conds = extract_code_maps(vq, train_loader, device,
-                                                     max_samples=args.limit_train)
-        val_codes, val_conds = extract_code_maps(vq, val_loader, device,
-                                                 max_samples=args.limit_val)
+        train_codes, train_conds = extract_code_maps(
+            vq, train_loader, device, max_samples=args.limit_train,
+            code_map_hw=code_map_hw)
+        val_codes, val_conds = extract_code_maps(
+            vq, val_loader, device, max_samples=args.limit_val,
+            code_map_hw=code_map_hw)
 
         os.makedirs(args.cache_dir, exist_ok=True)
         import numpy as np
@@ -192,9 +218,11 @@ def main():
     # ── Model ──
     model = MaskedCodeModel(vocab_size=args.num_codes + 1,
                             d_model=args.d_model, num_layers=args.num_layers,
-                            nhead=args.num_heads).to(device)
+                            nhead=args.num_heads,
+                            max_seq_len=seq_len).to(device)
     print(f"[Train] Params: {sum(p.numel() for p in model.parameters()):,}")
     print(f"  Transformer: {args.num_layers} layers, {args.num_heads} heads, {args.d_model} dim")
+    print(f"  Sequence length: {seq_len} ({code_map_hw}×{code_map_hw})")
 
     opt = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs - 5, eta_min=args.lr * 0.01)
@@ -213,7 +241,7 @@ def main():
 
         pbar = tqdm(train_loader, desc=f"E{epoch}", leave=False)
         for batch in pbar:
-            codes = batch["code_tokens"].to(device, non_blocking=True)  # (B, 1024)
+            codes = batch["code_tokens"].to(device, non_blocking=True)  # (B, S)
             cond = batch["condition"].to(device, non_blocking=True)     # (B, 11)
 
             # Random mask (variable ratio)
@@ -278,7 +306,7 @@ def main():
                 sampled_codes = model.sample_code_map(cond_sample, num_steps=8)
                 sampled_field = vq.decode_from_code(sampled_codes)
                 # Compare to GT for reference
-                gt_code_map = codes[:4].reshape(-1, 32, 32).to(device)
+                gt_code_map = codes[:4].reshape(-1, code_map_hw, code_map_hw).to(device)
                 gt_field = vq.decode_from_code(gt_code_map)
                 for b in range(4):
                     pred_bin = torch.sigmoid(sampled_field[b, 0]) > 0.5

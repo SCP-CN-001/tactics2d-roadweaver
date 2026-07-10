@@ -26,7 +26,7 @@ from collections import Counter
 import numpy as np
 import pandas as pd
 
-from src.skeleton_generator.utils import PATTERN_NAMES
+from src.skeleton_generator.config import PATTERN_NAMES
 SPLIT_RATIOS = {"train": 0.8, "val": 0.1, "test": 0.1}
 NUMERIC_FILTER_COLS = [
     "road_density_km_per_km2", "block_count",

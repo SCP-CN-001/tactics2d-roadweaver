@@ -17,7 +17,7 @@ from torch import nn, optim
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from tqdm import tqdm
 
-from .skeleton_dataset import make_field_dataloader, RESOLUTION
+from .config import CONFIG
 from .vq_vae import VQVAE
 from .losses import FieldLoss
 
@@ -51,21 +51,42 @@ def parse_args():
                    help="Wandb project name. Empty string = no logging.")
     p.add_argument("--num-codes", type=int, default=512,
                    help="Number of VQ codebook entries")
+    p.add_argument("--code-map-size", type=int, default=32, choices=[32, 64],
+                   help="Code map resolution (32 = current, 64 = ablation)")
+    p.add_argument("--resolution", type=int, default=128,
+                   help="Raster field resolution (128 for 2km, 256 for 5km)")
+    p.add_argument("--map-size", type=float, default=2000.0,
+                   help="Map size in meters (2000 for 2km, 5000 for 5km)")
+    p.add_argument("--data-dir", type=str, default=None,
+                   help="Override data split directory (e.g. data/urban_prior/splits_5km)")
     return p.parse_args()
 
 
 def main():
     args = parse_args()
+
+    # Apply config overrides from CLI
+    CONFIG.resolution = args.resolution
+    CONFIG.code_map_size = args.code_map_size
+    CONFIG.map_size_scale = args.map_size
+    if args.data_dir:
+        CONFIG.train_split_path = os.path.join(args.data_dir, "train.parquet")
+        CONFIG.val_split_path = os.path.join(args.data_dir, "val.parquet")
+
+    from .skeleton_dataset import make_field_dataloader  # delayed import uses updated CONFIG
+    resolution = CONFIG.resolution
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
     os.makedirs(args.output_dir, exist_ok=True)
     os.makedirs(os.path.join(args.output_dir, "checkpoints"), exist_ok=True)
 
     train_loader = make_field_dataloader("train", batch_size=args.batch_size, shuffle=True,
-        num_workers=args.num_workers, limit_samples=args.limit_train, resolution=RESOLUTION)
+        num_workers=args.num_workers, limit_samples=args.limit_train, resolution=resolution)
     val_loader = make_field_dataloader("val", batch_size=args.batch_size, shuffle=False,
-        num_workers=args.num_workers, limit_samples=args.limit_val, resolution=RESOLUTION)
+        num_workers=args.num_workers, limit_samples=args.limit_val, resolution=resolution)
 
-    model = VQVAE(resolution=RESOLUTION, num_codes=args.num_codes).to(device)
+    model = VQVAE(resolution=resolution, num_codes=args.num_codes,
+                  code_map_size=args.code_map_size).to(device)
     print(f"[VQ-VAE] Code map: {model.code_map_hw}×{model.code_map_hw}, codebook: {model.num_codes}×{model.embed_dim}")
     print(f"  Params: {sum(p.numel() for p in model.parameters()):,}")
 

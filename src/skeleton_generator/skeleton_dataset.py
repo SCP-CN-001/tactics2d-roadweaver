@@ -21,7 +21,7 @@ from .field_config import FIELD_CONFIG as cfg
 from .bfs_ordering import BFSOrdering
 from .graph_to_field import graph_to_field
 
-RESOLUTION = 128  # confirmed from Phase 0 roundtrip
+RESOLUTION = CONFIG.resolution  # mirrors config; change via --resolution CLI
 
 
 class SkeletonFieldDataset(Dataset):
@@ -59,7 +59,7 @@ class SkeletonFieldDataset(Dataset):
         structural_priors = torch.tensor(
             [row[c] for c in self._structural_cols], dtype=torch.float
         )
-        map_size = torch.tensor([2000.0, 2000.0], dtype=torch.float)
+        map_size = torch.tensor([CONFIG.map_size_scale, CONFIG.map_size_scale], dtype=torch.float)
         complexity = torch.zeros(1, dtype=torch.float)
 
         # Parse graph
