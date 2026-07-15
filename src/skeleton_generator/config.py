@@ -95,7 +95,7 @@ class GeneratorConfig:
     max_nodes_in_training: int = 150
 
     # ------ Checkpoint ------
-    checkpoint_dir: str = "checkpoints/spatial_conditional_skeleton_generator"
+    checkpoint_dir: str = "checkpoints/skeleton_generator"
 
     # ------ Inference ------
     default_node_budget: int = 50

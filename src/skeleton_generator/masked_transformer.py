@@ -1,16 +1,15 @@
 """
 Masked Code Transformer — conditional masked code completion.
 
-
-Predicts masked code tokens in a 32×32 code map given:
+Predicts masked code tokens in a code map given:
   - visible (unmasked) code tokens
   - 11-dim condition (style + structural priors)
 
 Architecture:
-  token embed (512 + 1 MASK) → learned pos embed (1024)
+  token embed (vocab_size) → learned pos embed (max_seq_len)
   + condition embed (via MLP, broadcast)
-  → Transformer encoder (6 layers, 8 heads, 512 dim)
-  → linear head → logits (513)
+  → Transformer encoder (N layers, H heads, d_model dim)
+  → linear head → logits (vocab_size)
 
 Training: masked language modeling (random mask, predict masked only).
 Inference: start from all-MASK, iteratively unmask high-confidence tokens.
@@ -49,14 +48,22 @@ class PositionalEncoding(nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    """Pre-norm Transformer encoder block."""
+    """Pre-norm Transformer encoder block with FlashAttention.
+
+    Uses F.scaled_dot_product_attention which automatically dispatches to
+    FlashAttention / Memory-Efficient Attention (O(n) memory instead of O(n²)).
+    """
 
     def __init__(self, d_model: int = 512, nhead: int = 8, dim_feedforward: int = 2048,
                  dropout: float = 0.1):
         super().__init__()
+        assert d_model % nhead == 0, f"d_model ({d_model}) must be divisible by nhead ({nhead})"
+        self.nhead = nhead
+        self.head_dim = d_model // nhead
         self.norm1 = nn.LayerNorm(d_model)
-        self.attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout,
-                                          batch_first=True)
+        self.qkv = nn.Linear(d_model, d_model * 3, bias=False)
+        self.out_proj = nn.Linear(d_model, d_model, bias=False)
+        self.attn_dropout = dropout
         self.norm2 = nn.LayerNorm(d_model)
         self.ffn = nn.Sequential(
             nn.Linear(d_model, dim_feedforward),
@@ -67,7 +74,21 @@ class TransformerBlock(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x + self.attn(self.norm1(x), self.norm1(x), self.norm1(x))[0]
+        # Self-attention with FlashAttention
+        B, S, D = x.shape
+        residual = x
+        x = self.norm1(x)
+
+        qkv = self.qkv(x).reshape(B, S, 3, self.nhead, self.head_dim).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]  # each: (B, nhead, S, head_dim)
+
+        attn_out = F.scaled_dot_product_attention(
+            q, k, v, dropout_p=self.attn_dropout if self.training else 0.0,
+            is_causal=False)
+        attn_out = attn_out.permute(0, 2, 1, 3).reshape(B, S, D)
+        x = residual + self.out_proj(attn_out)
+
+        # FFN
         x = x + self.ffn(self.norm2(x))
         return x
 
@@ -219,6 +240,7 @@ class MaskedCodeModel(nn.Module):
     @torch.no_grad()
     def sample_code_map(self, condition: torch.Tensor, num_steps: int = 8,
                          temperature: float = 1.0) -> torch.Tensor:
-        """Sample and reshape to (B, 32, 32) code map."""
+        """Sample and reshape to (B, H, W) code map."""
         tokens = self.sample(condition, num_steps=num_steps, temperature=temperature)
-        return tokens.reshape(-1, 32, 32)  # (B, 32, 32)
+        side = int(tokens.shape[-1] ** 0.5)
+        return tokens.reshape(-1, side, side)  # (B, side, side)

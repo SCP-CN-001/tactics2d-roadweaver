@@ -1,10 +1,79 @@
 """Binary road field → skeleton graph extraction."""
-from typing import Dict, List, Optional, Tuple
+from typing import Dict
 import numpy as np
 from skimage.morphology import skeletonize, dilation, square
 from skimage.morphology import remove_small_objects, remove_small_holes
 import networkx as nx
-from .graph_cleanup import prune_graph, cleanup_field
+
+
+def _prune_graph(graph: Dict, min_edge_len: float = 0.005, min_degree1_chain: int = 2) -> Dict:
+    """Post-process a skeleton graph: prune short dead-end branches."""
+    coords = graph['coords']
+    edges = graph['edge_index']
+    types = graph['node_types']
+    N = len(coords)
+    if N < 3 or len(edges) < 2:
+        return graph
+    adj = {i: set() for i in range(N)}
+    for (i, j) in edges:
+        if i < N and j < N:
+            adj[i].add(j)
+            adj[j].add(i)
+    changed = True
+    while changed:
+        changed = False
+        to_remove = set()
+        for i in range(N):
+            if i in to_remove:
+                continue
+            if len(adj[i]) == 1:
+                chain = [i]
+                prev = i
+                cur = list(adj[i])[0]
+                chain.append(cur)
+                while len(adj[cur]) == 2 and cur not in to_remove:
+                    nbrs = [n for n in adj[cur] if n != prev]
+                    if len(nbrs) != 1:
+                        break
+                    prev = cur
+                    cur = nbrs[0]
+                    chain.append(cur)
+                chain_len = sum(np.linalg.norm(coords[chain[k]] - coords[chain[k+1]])
+                                for k in range(len(chain)-1))
+                if chain_len < min_edge_len and len(chain) >= min_degree1_chain:
+                    for n in chain:
+                        if n not in to_remove:
+                            to_remove.add(n)
+                            for nb in adj[n]:
+                                if nb in adj:
+                                    adj[nb].discard(n)
+                            adj[n] = set()
+                    changed = True
+    if not to_remove:
+        return graph
+    keep = [i for i in range(N) if i not in to_remove]
+    id_map = {old: new for new, old in enumerate(keep)}
+    return {
+        "coords": coords[keep],
+        "edge_index": np.array(
+            [[id_map[i], id_map[j]] for (i, j) in edges if i not in to_remove and j not in to_remove],
+            dtype=np.int64) if edges else np.zeros((0, 2), dtype=np.int64),
+        "node_types": types[keep],
+    }
+
+
+def _cleanup_field(road_binary: np.ndarray, opening_radius: int = 2,
+                    closing_radius: int = 2, min_obj_size: int = 64) -> np.ndarray:
+    """Morphological cleanup for generated road fields."""
+    from scipy.ndimage import binary_opening, binary_closing
+    from skimage.morphology import remove_small_objects, square
+    if opening_radius > 0:
+        road_binary = binary_opening(road_binary, structure=square(opening_radius * 2 + 1))
+    if closing_radius > 0:
+        road_binary = binary_closing(road_binary, structure=square(closing_radius * 2 + 1))
+    if min_obj_size > 0:
+        road_binary = remove_small_objects(road_binary, min_size=min_obj_size)
+    return road_binary
 
 def field_to_graph(
     road_prob: np.ndarray,
@@ -52,7 +121,7 @@ def field_to_graph(
 
     # Morphological cleanup (critical for generated fields)
     if cleanup:
-        road_binary = cleanup_field(
+        road_binary = _cleanup_field(
             road_binary, opening_radius=opening_radius,
             closing_radius=closing_radius, min_obj_size=64)
 
@@ -168,7 +237,7 @@ def field_to_graph(
 
     # Optional pruning
     if prune_short_branches:
-        graph_out = prune_graph(graph_out, min_edge_len=min_edge_len)
+        graph_out = _prune_graph(graph_out, min_edge_len=min_edge_len)
 
     return graph_out
 

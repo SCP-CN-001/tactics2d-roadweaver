@@ -1,7 +1,11 @@
 """
-G1: individual front growth (full coverage) + A* endpoint closure.
-G2: raster-based face infill.
-After all growth: merge close nodes.
+Road network growth — G1 collector roads + A* closure + G2 face infill.
+
+Pipeline:
+  1. G1: seeds sampled along H-edges → bidirectional collector road growth.
+  2. A* endpoint closure: unused G1 endpoints are routed back to the nearest road.
+  3. G2: raster-based face infill — detect empty regions and cut internal roads.
+  4. Final merge: snap G1 nodes onto H-edges.
 """
 from __future__ import annotations
 
@@ -16,7 +20,6 @@ from shapely.geometry import LineString, Point, Polygon
 from .config import GrowthConfig
 from .tensor_field import GraphTensorField, normalize
 from utils.pathfinding import astar_connect_path, cost_map_from_road
-from utils.graph_ops import merge_close_nodes
 
 
 def _nid(G: nx.Graph) -> int:
@@ -426,3 +429,34 @@ def grow(coords_m, ei, nt, road_field, config):
     # Final cleanup: snap G1 nodes to H edges
     G = final_merge(G, config)
     return to_dict(G, config.map_width_m)
+
+
+def assign_attributes(graph: dict, config) -> dict:
+    """Add per-edge attributes: lanes, bidirectional, speed, surface."""
+    from .config import GrowthConfig
+    rc = graph.get("road_class", np.ones(len(graph["edge_index"]), dtype=np.int64))
+    E = len(graph["edge_index"])
+
+    lanes = np.zeros(E, dtype=np.int64)
+    bidirectional = np.ones(E, dtype=bool)
+    speed = np.zeros(E, dtype=np.int64)
+    surface = np.full(E, "paved", dtype=object)
+
+    for ei in range(E):
+        cls = int(rc[ei])
+        if cls == 1:
+            lanes[ei] = config.arterial_lanes_per_dir
+            speed[ei] = 60
+        elif cls == 2:
+            lanes[ei] = config.collector_lanes_per_dir
+            speed[ei] = 40
+        else:
+            lanes[ei] = config.local_lanes_per_dir
+            speed[ei] = 20
+        bidirectional[ei] = True
+
+    graph["lanes_per_dir"] = lanes
+    graph["bidirectional"] = bidirectional
+    graph["speed_limit_kmh"] = speed
+    graph["surface"] = surface
+    return graph

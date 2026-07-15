@@ -40,12 +40,15 @@ class AnchorSampler:
     def __init__(self, cache_path: str = "cache/masked_code_maps/train.npz",
                  cluster_cache_path: Optional[str] = None,
                  n_neighbors: int = 5, anchor_ratio: float = 0.1,
-                 seed: int = 42):
+                 seed: int = 42,
+                 code_map_hw: int = 32):
         self.n_neighbors = n_neighbors
         self.anchor_ratio = anchor_ratio
         self.base_seed = seed
         self.rng = np.random.default_rng(seed)
         self.use_clusters = cluster_cache_path is not None
+        self.code_map_hw = code_map_hw
+        self.S = code_map_hw * code_map_hw
 
         if self.use_clusters:
             import pickle
@@ -112,7 +115,7 @@ class AnchorSampler:
           - seed-based determinism for reproducibility
         """
         MASK_ID = MaskedCodeModel.MASK_TOKEN_ID
-        S = 1024
+        S = self.S
 
         # Randomize anchor ratio per call (5-15%) if not explicitly set
         if anchor_ratio is not None:
@@ -213,14 +216,16 @@ class AnchorGenerator(nn.Module):
 
         # Anchor sampler
         self.sampler = AnchorSampler(cache_path=cache_path,
-                                     cluster_cache_path=cluster_cache_path)
+                                     cluster_cache_path=cluster_cache_path,
+                                     code_map_hw=code_map_hw)
 
         print(f"  [AnchorGenerator] VQ + Transformer loaded, anchors via {'clusters' if cluster_cache_path else 'full cache'}")
 
     def set_cache(self, cache_path: str, cluster_cache_path: Optional[str] = None):
-        """Replace anchor cache."""
+        """Replace anchor cache, preserving current code map size."""
         self.sampler = AnchorSampler(cache_path=cache_path,
-                                     cluster_cache_path=cluster_cache_path)
+                                     cluster_cache_path=cluster_cache_path,
+                                     code_map_hw=self.sampler.code_map_hw)
 
     @torch.no_grad()
     def generate_code_map(self, condition: torch.Tensor, anchor_ratio: Optional[float] = None,
@@ -243,10 +248,10 @@ class AnchorGenerator(nn.Module):
             temperature: sampling temperature
             top_p: nucleus sampling threshold
         Returns:
-            code_map: (B, 32, 32)
+            code_map: (B, H, W) where H=W=code_map_hw
         """
         B = condition.shape[0]
-        S = 1024
+        S = self.sampler.S  # code_map_hw ** 2
         MASK_ID = MaskedCodeModel.MASK_TOKEN_ID
 
         # Get anchors for each sample
@@ -329,7 +334,8 @@ class AnchorGenerator(nn.Module):
             logits = self.model(tokens, remaining, condition)
             tokens[remaining] = logits[remaining].argmax(dim=-1)
 
-        return tokens.reshape(-1, 32, 32)
+        side = int(math.isqrt(self.model.max_seq_len))
+        return tokens.reshape(-1, side, side)
 
     @torch.no_grad()
     def generate_adaptive(self, condition: torch.Tensor, seed: Optional[int] = None,

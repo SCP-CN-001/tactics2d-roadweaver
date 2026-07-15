@@ -10,7 +10,7 @@ Components:
 from .config import GrowthConfig
 from .tensor_field import GraphTensorField
 from .growth import grow
-from .attribute import assign_attributes
+from .growth import assign_attributes
 
 __all__ = [
     "GrowthConfig",

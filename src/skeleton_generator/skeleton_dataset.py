@@ -17,7 +17,6 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 
 from .config import CONFIG
-from .field_config import FIELD_CONFIG as cfg
 from .bfs_ordering import BFSOrdering
 from .graph_to_field import graph_to_field
 
