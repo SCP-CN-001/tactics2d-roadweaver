@@ -1,0 +1,35 @@
+# See https://pre-commit.com for more information
+# See https://pre-commit.com/hooks.html for more hooks
+repos:
+- repo: https://github.com/pre-commit/pre-commit-hooks
+  rev: v5.0.0
+  hooks:
+  - id: trailing-whitespace
+    exclude: tactics2d/participant/trajectory_classifier.m
+  - id: end-of-file-fixer
+    exclude: tactics2d/participant/trajectory_classifier.m
+  - id: check-toml
+  - id: check-yaml
+  - id: check-added-large-files
+    args: [--maxkb=5000]
+  - id: requirements-txt-fixer
+# - repo: https://github.com/astral-sh/ruff-pre-commit
+#   rev: v0.15.0
+#   hooks:
+#   - id: ruff-check
+#     args: [--fix]
+- repo: https://github.com/asottile/pyupgrade
+  rev: v3.20.0
+  hooks:
+  - id: pyupgrade
+- repo: https://github.com/pycqa/isort
+  rev: 6.0.1
+  hooks:
+  - id: isort
+    args: [--profile=black, --line-length=100]
+    types_or: [python, pyi, jupyter]
+- repo: https://github.com/python/black
+  rev: 25.1.0
+  hooks:
+  - id: black-jupyter
+    args: ["--line-length", "100", "--color", "--skip-magic-trailing-comma"]

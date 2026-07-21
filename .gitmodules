@@ -1,0 +1,6 @@
+[submodule "metadrive"]
+	path = metadrive
+	url = git@github.com:metadriverse/metadrive.git
+[submodule "HDMapGen"]
+	path = HDMapGen
+	url = git@github.com:agshar96/HDMapGen.git
