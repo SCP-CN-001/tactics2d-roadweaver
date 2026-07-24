@@ -1,6 +1,12 @@
 [submodule "metadrive"]
-	path = metadrive
+	path = baselines/MetaDrive
 	url = git@github.com:metadriverse/metadrive.git
 [submodule "HDMapGen"]
-	path = HDMapGen
+	path = baselines/HDMapGen
 	url = git@github.com:agshar96/HDMapGen.git
+[submodule "RoadGen"]
+	path = baselines/RoadGen
+	url = git@github.com:roadgen/RoadGen.git
+[submodule "sledge"]
+	path = baselines/SLEDGE
+	url = git@github.com:autonomousvision/sledge.git

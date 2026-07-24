@@ -1,0 +1,21 @@
+# VQ-VAE training configuration
+
+# Data
+data_dir: "data/urban_prior/5km/splits"
+resolution: 256
+code_map_size: 64
+num_codes: 2048
+
+# Model
+embed_dim: 128
+commitment_cost: 0.25
+decay: 0.99
+
+# Training
+epochs: 80
+batch_size: 256
+lr: 0.001
+num_workers: 16
+limit_train: null
+limit_val: 200
+output_dir: "runtimes/vq_vae_5km_v2"
