@@ -1,0 +1,23 @@
+# Transformer training — 5km WITH style labels
+
+data_dir: "data/urban_prior/5km/splits_keras"
+vq_checkpoint: "runtimes/vq_vae_5km_v4/checkpoints/best.pth"
+cache_dir: "cache/masked_code_maps_5km_v4_style"
+
+num_codes: 512
+code_map_size: 32
+resolution: 128
+
+d_model: 256
+num_layers: 6
+nhead: 4
+
+epochs: 50
+batch_size: 128
+lr: 0.001
+num_workers: 8
+limit_train: null
+limit_val: 200
+output_dir: "runtimes/transformer_5km_v4_style"
+balanced_sampling: true
+wandb_project: "roadweaver-transformer"

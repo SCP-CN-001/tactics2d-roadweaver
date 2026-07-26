@@ -7,9 +7,10 @@ H-Graph and propagating them via Gaussian-weighted neighbours.
 Each query returns (major_axis, minor_axis, anisotropy) at a given point,
 where major_axis is the dominant road direction and minor_axis is orthogonal.
 """
+
 from __future__ import annotations
 
-from typing import List, Optional, Tuple
+from typing import List, Tuple
 
 import numpy as np
 from scipy.spatial import cKDTree
@@ -24,16 +25,14 @@ def normalize(v: np.ndarray) -> np.ndarray:
 
 
 def sample_linestring_tangents(
-    line: LineString,
-    step_m: float,
-    eps: float = 2.0,
-) -> List[Tuple[np.ndarray, np.ndarray]]:
+    line: LineString, step_m: float, eps: float = 2.0
+) -> list[tuple[np.ndarray, np.ndarray]]:
     """Sample (position, tangent) pairs along a LineString at ~step_m intervals."""
     length = line.length
     if length < 1:
         return []
     count = max(2, int(np.ceil(length / step_m)) + 1)
-    samples: List[Tuple[np.ndarray, np.ndarray]] = []
+    samples: list[tuple[np.ndarray, np.ndarray]] = []
     for d in np.linspace(0, length, count):
         pt = np.asarray(line.interpolate(d).coords[0])
         d0 = max(0.0, d - eps)
@@ -70,15 +69,22 @@ class GraphTensorField:
         step_m: float = 20.0,
         radius_m: float = 220.0,
         sigma_m: float = 90.0,
-    ) -> "GraphTensorField":
+        tangent_smooth_radius: float = 0.0,
+    ) -> GraphTensorField:
         """Build tensor field from H-Graph (metre coordinates).
+
+        When *tangent_smooth_radius* > 0, nearby tangents are averaged
+        together (weighted by distance) — this produces a more uniform
+        direction field suited for grid-like road patterns.
 
         Args:
             coords_m: (N, 2) node positions in metres.
             edge_index: (E, 2) edge indices.
             step_m: sampling interval along edges.
-            radius_m: neighbour search radius.
-            sigma_m: Gaussian falloff.
+            radius_m: neighbour search radius at query time.
+            sigma_m: Gaussian falloff at query time.
+            tangent_smooth_radius: if > 0, smooth tangents by averaging
+                neighbours within this radius (metres).
 
         Returns:
             GraphTensorField instance.
@@ -98,7 +104,6 @@ class GraphTensorField:
                 positions.append(pt)
                 tangents.append(t)
         if not positions:
-            # Fallback: use edge directions directly
             for u, v in edge_index:
                 u, v = int(u), int(v)
                 ev = coords_m[v] - coords_m[u]
@@ -109,17 +114,30 @@ class GraphTensorField:
                 mid = (coords_m[u] + coords_m[v]) / 2
                 positions.append(mid)
                 tangents.append(t)
-        return cls(
-            positions=np.array(positions, dtype=np.float64),
-            tangents=np.array(tangents, dtype=np.float64),
-            radius_m=radius_m,
-            sigma_m=sigma_m,
-        )
 
-    def axes(
-        self,
-        position: np.ndarray,
-    ) -> Tuple[np.ndarray, np.ndarray, float]:
+        pos_arr = np.array(positions, dtype=np.float64)
+        tan_arr = np.array(tangents, dtype=np.float64)
+
+        # ── Tangent smoothing: make nearby tangents more parallel ───────
+        if tangent_smooth_radius > 0 and len(pos_arr) > 5:
+            tree = cKDTree(pos_arr)
+            smoothed = np.zeros_like(tan_arr)
+            for i in range(len(pos_arr)):
+                nb_idx = tree.query_ball_point(pos_arr[i], tangent_smooth_radius)
+                if len(nb_idx) > 1:
+                    nbs = tan_arr[nb_idx]
+                    dists = np.linalg.norm(pos_arr[nb_idx] - pos_arr[i], axis=1)
+                    w = np.exp(-dists / max(tangent_smooth_radius * 0.5, 1.0))
+                    w = w / max(w.sum(), 1e-10)
+                    avg = np.sum(nbs * w[:, None], axis=0)
+                    smoothed[i] = normalize(avg)
+                else:
+                    smoothed[i] = tan_arr[i]
+            tan_arr = smoothed
+
+        return cls(positions=pos_arr, tangents=tan_arr, radius_m=radius_m, sigma_m=sigma_m)
+
+    def axes(self, position: np.ndarray) -> tuple[np.ndarray, np.ndarray, float]:
         """Query major axis, minor axis, and anisotropy at *position*.
 
         Returns:
@@ -130,15 +148,11 @@ class GraphTensorField:
         """
         indices = self.tree.query_ball_point(position, self.radius_m)
         if not indices:
-            return (
-                np.array([1.0, 0.0]),
-                np.array([0.0, 1.0]),
-                0.0,
-            )
+            return (np.array([1.0, 0.0]), np.array([0.0, 1.0]), 0.0)
         local_pos = self.positions[indices]
         local_tan = self.tangents[indices]
         dists = np.linalg.norm(local_pos - position[None, :], axis=1)
-        weights = np.exp(-(dists ** 2) / (2.0 * self.sigma_m ** 2))
+        weights = np.exp(-(dists**2) / (2.0 * self.sigma_m**2))
 
         tensor = np.zeros((2, 2), dtype=np.float64)
         for t, w in zip(local_tan, weights):
@@ -159,11 +173,7 @@ class GraphTensorField:
             return -axis
         return axis
 
-    def choose_direction(
-        self,
-        position: np.ndarray,
-        previous_direction: np.ndarray,
-    ) -> np.ndarray:
+    def choose_direction(self, position: np.ndarray, previous_direction: np.ndarray) -> np.ndarray:
         """Pick the tensor axis (major or minor) closest to *previous_direction*."""
         major, minor, _ = self.axes(position)
         major = self.align_axis(major, previous_direction)

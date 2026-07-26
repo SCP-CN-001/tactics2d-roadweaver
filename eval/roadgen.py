@@ -24,7 +24,6 @@ Output:
         topology.json          — topological validity results
         route_coverage.json    — route coverage results
         scalability.csv        — CSV for plotting
-        paper_tables/          — LaTeX table rows for copy-paste
 
 Notes:
     - RoadGen runs from the RoadGen/python/ directory (its imports rely on it).
@@ -52,15 +51,18 @@ from pathlib import Path
 
 import networkx as nx
 import numpy as np
+from tqdm import tqdm
 
 from eval.metrics import (
     classify_scale,
+    compute_all_geometric_metrics,
     compute_route_coverage,
     compute_topological_metrics,
+    get_resource_stats,
     load_osm_reference_degree,
     print_results_table,
     save_results,
-    save_tex_row,
+    save_system_info,
 )
 from eval.polyline_graph import polylines_to_graph, save_vis
 
@@ -69,7 +71,7 @@ from eval.polyline_graph import polylines_to_graph, save_vis
 # ═══════════════════════════════════════════════════════════════════════════
 
 ROOT = Path(__file__).resolve().parent.parent
-ROADGEN_PY = ROOT / "RoadGen" / "python"
+ROADGEN_PY = ROOT / "baselines" / "RoadGen" / "python"
 OUT_DIR = ROOT / "runtimes" / "roadgen_eval"
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -325,6 +327,7 @@ def generate_one_map(
 
     # ── Polyline collector ──────────────────────────────────────────
     all_polylines: list[np.ndarray] = []
+    bridge_polylines: list[np.ndarray] = []  # for mask rendering only, excluded from metrics
 
     def _add_bridge(ep):
         """Add a short bridge polyline at *ep* to close gaps at junction connections.
@@ -333,11 +336,15 @@ def generate_one_map(
         (RoadGen space), which at 1024×1024 renders as ~10 pixels — enough for
         the skeleton dilation to merge nearby road segments across a junction
         widget that does not provide ``getlanepoint()`` data.
+
+        Bridges are kept separate from ``all_polylines`` so they are used for
+        mask rendering and graph extraction but NOT for geometric metric
+        evaluation.
         """
         ep_a = np.array(ep, dtype=np.float64)
         L = 3.0
-        all_polylines.append(np.array([ep_a + [-L, 0.0], ep_a, ep_a + [L, 0.0]]))
-        all_polylines.append(np.array([ep_a + [0.0, -L], ep_a, ep_a + [0.0, L]]))
+        bridge_polylines.append(np.array([ep_a + [-L, 0.0], ep_a, ep_a + [L, 0.0]]))
+        bridge_polylines.append(np.array([ep_a + [0.0, -L], ep_a, ep_a + [0.0, L]]))
 
     t0 = time.time()
 
@@ -453,8 +460,13 @@ def generate_one_map(
             return None, float("nan")
 
         # ── Convert lane polylines → binary mask → skeleton graph ──
+        # NOTE: bridge_polylines are merged here for mask rendering so that
+        #       skeletonised graph captures junction connectivity, but they
+        #       are NOT returned to callers and therefore NOT passed to
+        #       geometric metric functions.
+        graph_polylines = all_polylines + bridge_polylines
         G = polylines_to_graph(
-            all_polylines, resolution=mask_resolution, cleanup=False, merge_distance=3.0
+            graph_polylines, resolution=mask_resolution, cleanup=False, merge_distance=3.0
         )
 
         if G.number_of_nodes() == 0:
@@ -567,13 +579,6 @@ def run_topology_eval(
     agg["osm_reference_avg_degree"] = ref_deg
 
     save_results(output_dir, "topology", agg, per_map)
-    save_tex_row(
-        output_dir,
-        "topological-validity",
-        "RoadGen",
-        agg,
-        fields=[("lcc", ".3f"), ("dead_end_ratio", ".3f"), ("delta_avg_degree", ".3f")],
-    )
     print_results_table(
         "Topological Validity (RoadGen)",
         agg,
@@ -662,13 +667,6 @@ def run_route_eval(
     agg["widget_number"] = widget_number
 
     save_results(output_dir, "route_coverage", agg, per_map)
-    save_tex_row(
-        output_dir,
-        "route-coverage",
-        "RoadGen",
-        agg,
-        fields=[("reachable_ratio", ".3f"), ("avg_route_length", ".1f")],
-    )
     print_results_table(
         "Route Coverage (RoadGen)",
         agg,
@@ -702,7 +700,7 @@ def run_scalability_eval(
     target_widgets = list(range(4, 41, 4))
     all_results: list[dict] = []
 
-    for wc in target_widgets:
+    for wc in tqdm(target_widgets, desc="Scaling"):
         per_size: dict = {"target_widgets": wc, "maps": []}
 
         for i in range(n_per_size):
@@ -765,10 +763,6 @@ def run_scalability_eval(
         print("  [ERROR] No valid scalability data. Aborting.")
         return {}
 
-    # Save JSON
-    out = {"results": all_results}
-    save_results(output_dir, "scalability", out, per_map=None)
-
     # Save CSV for plotting
     csv_path = output_dir / "scalability.csv"
     with open(csv_path, "w") as f:
@@ -796,6 +790,85 @@ def run_scalability_eval(
 
     print(f"\n  CSV saved to {csv_path}")
     return {"n_sizes": len(all_results), "n_per_size": n_per_size}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Section 4: Geometric Validity  (Table 2)  — RoadGen
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def run_geometry_eval(
+    num_maps: int = 200,
+    seed: int = 0,
+    widget_number: int = 8,
+    output_dir: Path = OUT_DIR,
+    mask_resolution: int = 1024,
+) -> dict:
+    """Generate maps and compute all geometric metrics from lane polylines."""
+    print(f"\n{'=' * 60}")
+    print("Section 4: Geometric Validity  (RoadGen)")
+    print(
+        f"  Generating {num_maps} maps ({widget_number} widgets each, "
+        f"mask={mask_resolution}²)..."
+    )
+    print(f"{'=' * 60}")
+
+    geom_metrics: dict[str, list] = defaultdict(list)
+    all_results: list[dict] = []
+
+    for i in range(num_maps):
+        G, gen_time, polylines = generate_one_map(
+            widget_number=widget_number, mask_resolution=mask_resolution
+        )
+        if G is None or G.number_of_nodes() < 2:
+            continue
+
+        geo = compute_all_geometric_metrics(polylines, G=G)
+
+        entry = {
+            "map_id": i,
+            "generation_time": round(gen_time, 4),
+            "node_count": G.number_of_nodes(),
+            "edge_count": G.number_of_edges(),
+            **geo,
+        }
+        for k, v in geo.items():
+            if isinstance(v, (int, float, np.floating, np.integer)):
+                geom_metrics[k].append(v)
+        all_results.append(entry)
+
+        if (i + 1) % max(1, num_maps // 10) == 0 or i == 0:
+            print(
+                f"    [{i + 1}/{num_maps}] "
+                f"chamfer_loo={np.mean(geom_metrics['chamfer_loo']):.4f}"
+            )
+
+    if not all_results:
+        print("  [ERROR] No valid maps generated. Aborting geometry eval.")
+        return {}
+
+    agg = {}
+    for k, v in geom_metrics.items():
+        agg[f"{k}_mean"] = float(np.mean(v))
+        agg[f"{k}_std"] = float(np.std(v))
+    agg["n_maps"] = len(all_results)
+
+    save_results(output_dir, "geometry", agg, all_results)
+    print_results_table(
+        "Geometric Validity (RoadGen)",
+        agg,
+        [
+            ("chamfer_loo", "Chamfer (LOO)", ".4f"),
+            ("endpoint_alignment", "Endpoint Align", ".4f"),
+            ("mean_turning_angle_deg", "Turning Angle", ".2f"),
+            ("mean_edge_length", "Edge Length", ".4f"),
+            ("cv_edge_length", "Length CV", ".3f"),
+            ("intersection_rate", "Intersect Rate", ".6f"),
+            ("mean_spacing_cv", "Subnode Uniformity", ".3f"),
+        ],
+    )
+
+    return agg
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -848,6 +921,7 @@ def main():
     parser.add_argument("--all", action="store_true", help="Run all sections")
     parser.add_argument("--topology", action="store_true", help="Topological validity (Table 1)")
     parser.add_argument("--route", action="store_true", help="Route coverage (Table 3)")
+    parser.add_argument("--geometry", action="store_true", help="Geometric validity (Table 2)")
     parser.add_argument(
         "--scalability", action="store_true", help="Large-scale capability (Figure)"
     )
@@ -886,38 +960,151 @@ def main():
 
     args = parser.parse_args()
     output_dir = Path(args.output)
-    vis_dir = Path(args.vis) if args.vis else None
+    vis_dir = Path(args.vis).resolve() if args.vis else None
 
     # Global settings
     global SILENT
     SILENT = args.silent
 
-    # Default: run all if no section specified
-    run_all = args.all or not (args.topology or args.route or args.scalability)
+    init_stats = get_resource_stats()
+    peak_stats = dict(init_stats)
 
+    run_all = args.all or not (args.topology or args.route or args.geometry or args.scalability)
     _print_timing_estimate(args, run_all)
 
-    if run_all or args.topology:
-        run_topology_eval(
-            args.num_maps,
-            widget_number=args.widget_number,
-            output_dir=output_dir,
-            mask_resolution=args.resolution,
-            vis_dir=vis_dir,
-        )
+    if run_all:
+        ref_deg = load_osm_reference_degree()
+        target_bins = list(range(5, 61, 5))
+        bin_counts = {b: 0 for b in target_bins}
 
-    if run_all or args.route:
-        run_route_eval(
-            args.num_maps,
-            widget_number=args.widget_number,
-            output_dir=output_dir,
-            mask_resolution=args.resolution,
-        )
+        def _bin(n):
+            return ((n - 1) // 5) * 5 + 5
 
-    if run_all or args.scalability:
-        run_scalability_eval(
-            args.n_per_size, output_dir=output_dir, mask_resolution=args.resolution
-        )
+        params = [(6, "small"), (10, "medium"), (14, "medium"), (18, "large"), (22, "large")]
+        per_map = []
+        t0 = time.time()
+        for wn, _label in params:
+            for i in range(30):
+                if all(c >= 5 for c in bin_counts.values()):
+                    break
+                try:
+                    G, gt, polylines = generate_one_map(
+                        widget_number=wn, mask_resolution=args.resolution
+                    )
+                except Exception:
+                    continue
+                if G is None or G.number_of_nodes() < 2:
+                    continue
+                nb = _bin(G.number_of_nodes())
+                if nb in bin_counts and bin_counts[nb] >= 5:
+                    continue
+                resource = get_resource_stats()
+                topo = compute_topological_metrics(G, ref_avg_degree=ref_deg)
+                route = compute_route_coverage(G, n_pairs=100, seed=i)
+                geo = compute_all_geometric_metrics(polylines, G=G)
+                scale = classify_scale(topo["node_count"])
+                if vis_dir is not None:
+                    cnt = len(list(Path(vis_dir).glob(f"rg_{scale}_*.png")))
+                    if cnt < 5:
+                        save_vis(
+                            polylines,
+                            G,
+                            str(
+                                Path(vis_dir)
+                                / f"rg_{scale}_N{G.number_of_nodes()}E{G.number_of_edges()}_{cnt}.png"
+                            ),
+                        )
+                per_map.append(
+                    {
+                        "map_id": len(per_map),
+                        "gen_time_s": round(gt, 4),
+                        "scale": scale,
+                        **resource,
+                        **topo,
+                        **route,
+                        **geo,
+                    }
+                )
+                if nb in bin_counts:
+                    bin_counts[nb] += 1
+                if len(per_map) % 5 == 0:
+                    filled = sum(1 for c in bin_counts.values() if c >= 5)
+                    print(f"  [{len(per_map)} maps] bins filled: {filled}/{len(target_bins)}")
+                if all(c >= 5 for c in bin_counts.values()):
+                    break
+        gen_time = time.time() - t0
+        print(f"  Bin counts: {dict(bin_counts)}")
+        import csv
+
+        cols = [
+            "map_id",
+            "scale",
+            "n_nodes",
+            "n_edges",
+            "lcc",
+            "dead_end_ratio",
+            "avg_degree",
+            "delta_avg_degree",
+            "reachable_ratio",
+            "avg_route_length",
+            "chamfer_loo",
+            "chamfer_loo_std",
+            "endpoint_alignment",
+            "mean_turning_angle_deg",
+            "intersection_rate",
+            "mean_edge_length",
+            "cv_edge_length",
+            "total_road_length",
+            "mean_spacing_cv",
+            "mean_angle_deg",
+            "gen_time_s",
+            "cpu_percent",
+            "mem_mb",
+            "gpu_mem_mb",
+        ]
+        key_map = {"n_nodes": "node_count", "n_edges": "edge_count"}
+        with open(output_dir / "all_metrics.csv", "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(cols)
+            for m in per_map:
+                w.writerow([m.get(key_map.get(c, c), "") for c in cols])
+        print(f"  Saved {len(per_map)} maps to {output_dir / 'all_metrics.csv'}")
+        print(f"  Gen: {gen_time:.1f}s total, {gen_time/max(len(per_map),1):.1f}s/map")
+        final_stats = get_resource_stats()
+        for k in peak_stats:
+            peak_stats[k] = max(peak_stats[k], final_stats[k])
+        save_system_info(output_dir, "RoadGen", init_stats, peak_stats, len(per_map))
+    else:
+        if args.topology:
+            run_topology_eval(
+                args.num_maps,
+                widget_number=args.widget_number,
+                output_dir=output_dir,
+                mask_resolution=args.resolution,
+                vis_dir=vis_dir,
+            )
+        if args.route:
+            run_route_eval(
+                args.num_maps,
+                widget_number=args.widget_number,
+                output_dir=output_dir,
+                mask_resolution=args.resolution,
+            )
+        if args.geometry:
+            run_geometry_eval(
+                args.num_maps,
+                widget_number=args.widget_number,
+                output_dir=output_dir,
+                mask_resolution=args.resolution,
+            )
+        if args.scalability:
+            run_scalability_eval(
+                args.n_per_size, output_dir=output_dir, mask_resolution=args.resolution
+            )
+        final_stats = get_resource_stats()
+        for k in peak_stats:
+            peak_stats[k] = max(peak_stats[k], final_stats[k])
+        save_system_info(output_dir, "RoadGen", init_stats, peak_stats, args.num_maps)
 
     # Cleanup temp directory
     temp_dir = ROOT / ".roadgen_tmp"

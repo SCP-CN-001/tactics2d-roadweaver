@@ -7,19 +7,19 @@ Pipeline:
   3. G2: raster-based face infill — detect empty regions and cut internal roads.
   4. Final merge: snap G1 nodes onto H-edges.
 """
+
 from __future__ import annotations
 
 import math
 import random
-from typing import Dict, List, Optional, Set, Tuple
 
 import networkx as nx
 import numpy as np
-from shapely.geometry import LineString, Point, Polygon
+from shapely.geometry import LineString, Point
 
-from .config import GrowthConfig
+from network_generator.topology.pathfinding import astar_connect_path, cost_map_from_road
+
 from .tensor_field import GraphTensorField, normalize
-from utils.pathfinding import astar_connect_path, cost_map_from_road
 
 
 def _nid(G: nx.Graph) -> int:
@@ -40,8 +40,9 @@ def to_graph(coords_m, ei, nt, level=0):
     for u, v in ei:
         u, v = int(u), int(v)
         pu, pv = coords_m[u], coords_m[v]
-        G.add_edge(u, v, geom=LineString([pu, pv]),
-                    length=float(np.linalg.norm(pv - pu)), level=level)
+        G.add_edge(
+            u, v, geom=LineString([pu, pv]), length=float(np.linalg.norm(pv - pu)), level=level
+        )
     return G
 
 
@@ -56,35 +57,55 @@ def to_dict(G, map_m):
         lv = int(d.get("level", 0))
         rc.append(min(lv + 1, 3))
         el.append(float(d.get("length", 1)))
-        deg[u] += 1; deg[v] += 1
+        deg[u] += 1
+        deg[v] += 1
     e = np.array(e, dtype=np.int64).reshape(-1, 2) if e else np.empty((0, 2), dtype=np.int64)
     nt = np.array([1 if deg[n] >= 3 else (4 if deg[n] <= 1 else 0) for n in nodes], dtype=np.int64)
-    return {"coords": c, "edge_index": e, "edge_lengths_m": np.array(el, dtype=np.float32),
-            "road_class": np.array(rc, dtype=np.int64), "node_types": nt, "map_size_m": map_m}
+    return {
+        "coords": c,
+        "edge_index": e,
+        "edge_lengths_m": np.array(el, dtype=np.float32),
+        "road_class": np.array(rc, dtype=np.int64),
+        "node_types": nt,
+        "map_size_m": map_m,
+    }
 
 
 def add_e(G, u, v, level):
-    if G.has_edge(u, v): return
+    if G.has_edge(u, v):
+        return
     pu, pv = G.nodes[u]["pos"], G.nodes[v]["pos"]
-    G.add_edge(u, v, geom=LineString([pu, pv]),
-                length=float(np.linalg.norm(pv - pu)), level=level)
+    G.add_edge(u, v, geom=LineString([pu, pv]), length=float(np.linalg.norm(pv - pu)), level=level)
 
 
 def split_e(G, u, v, pt):
-    if not G.has_edge(u, v): return None
+    if not G.has_edge(u, v):
+        return None
     d = G.edges[u, v]
     g = d["geom"]
     da = g.project(Point(pt))
-    if da < 1e-6: return u
-    if g.length - da < 1e-6: return v
+    if da < 1e-6:
+        return u
+    if g.length - da < 1e-6:
+        return v
     nid = _nid(G)
     G.add_node(nid, pos=pt.copy())
     lv = d.get("level", 3)
     G.remove_edge(u, v)
-    G.add_edge(u, nid, geom=LineString([np.asarray(g.coords[0]), pt]),
-               length=float(np.linalg.norm(np.asarray(g.coords[0]) - pt)), level=lv)
-    G.add_edge(nid, v, geom=LineString([pt, np.asarray(g.coords[-1])]),
-               length=float(np.linalg.norm(pt - np.asarray(g.coords[-1]))), level=lv)
+    G.add_edge(
+        u,
+        nid,
+        geom=LineString([np.asarray(g.coords[0]), pt]),
+        length=float(np.linalg.norm(np.asarray(g.coords[0]) - pt)),
+        level=lv,
+    )
+    G.add_edge(
+        nid,
+        v,
+        geom=LineString([pt, np.asarray(g.coords[-1])]),
+        length=float(np.linalg.norm(pt - np.asarray(g.coords[-1]))),
+        level=lv,
+    )
     return nid
 
 
@@ -118,7 +139,9 @@ def gen_seeds(G, config, rng=None):
             if nid is None:
                 continue
             for sign in (-1.0, 1.0):
-                direction = normalize(sign * normal + rng.uniform(-0.15, 0.15) * ed)
+                direction = normalize(
+                    sign * normal + rng.uniform(-config.g1_seed_jitter, config.g1_seed_jitter) * ed
+                )
                 seeds.append({"nid": nid, "pos": pt.copy(), "dir": direction, "pe": (u, nid)})
     return seeds
 
@@ -126,16 +149,24 @@ def gen_seeds(G, config, rng=None):
 # ── G1: growth direction ─────────────────────────────────────────────
 
 
-def grow_dir(pos, prev, tf, config):
+def grow_dir(pos, prev, tf, config, rng=None):
+    """Growth direction with per-step style jitter."""
     tensor_dir = tf.choose_direction(pos, prev)
     r = config.w_tensor * tensor_dir + 0.30 * prev
     r = normalize(r)
-    if np.linalg.norm(r) < 1e-9: return prev.copy()
+    if np.linalg.norm(r) < 1e-9:
+        return prev.copy()
     dv = np.clip(np.dot(r, prev), -1.0, 1.0)
     ang = math.degrees(math.acos(dv))
     if ang > config.max_turn_deg:
         ratio = config.max_turn_deg / max(ang, 1e-6)
         r = normalize((1.0 - ratio) * prev + ratio * r)
+    # Per-step jitter: small direction perturbation each step
+    if config.per_step_jitter_deg > 0.5 and rng is not None:
+        j = math.radians(config.per_step_jitter_deg * (rng.random() * 2.0 - 1.0))
+        ca, sa = math.cos(j), math.sin(j)
+        rx, ry = r[0], r[1]
+        r = normalize(np.array([ca * rx - sa * ry, sa * rx + ca * ry]))
     return r
 
 
@@ -146,11 +177,13 @@ def find_snap(G, pos, p_edges, snap_r, exclude_level=None):
     pt = Point(pos)
     best = None
     for u, v, d in G.edges(data=True):
-        if (u, v) in p_edges or (v, u) in p_edges: continue
+        if (u, v) in p_edges or (v, u) in p_edges:
+            continue
         if exclude_level is not None and d.get("level", 0) == exclude_level:
             continue
         dist = pt.distance(d["geom"])
-        if dist > snap_r: continue
+        if dist > snap_r:
+            continue
         proj = np.asarray(d["geom"].interpolate(d["geom"].project(pt)).coords[0])
         if best is None or dist < best["d"]:
             best = {"u": u, "v": v, "pt": proj, "d": float(dist)}
@@ -166,13 +199,22 @@ def grow_g1(G, tf, config, rng=None):
         rng = random.Random(config.random_seed)
 
     seeds = gen_seeds(G, config, rng)
-    fronts = [{"nid": s["nid"], "pos": s["pos"].copy(), "dir": s["dir"].copy(),
-                "trav": 0.0, "pe": s["pe"], "alive": True} for s in seeds]
+    fronts = [
+        {
+            "nid": s["nid"],
+            "pos": s["pos"].copy(),
+            "dir": s["dir"].copy(),
+            "trav": 0.0,
+            "pe": s["pe"],
+            "alive": True,
+        }
+        for s in seeds
+    ]
 
     step_m = config.g1_step_m
     max_steps = config.g1_max_steps
     max_len = config.g1_max_length_m
-    snap_r = config.snap_radius_m
+    snap_r = config.snap_radius_m * config.snap_radius_scale
 
     for _ in range(max_steps):
         active = [f for f in fronts if f["alive"] and f["trav"] < max_len]
@@ -181,11 +223,10 @@ def grow_g1(G, tf, config, rng=None):
 
         new_fronts = []
         for fr in active:
-            d = grow_dir(fr["pos"], fr["dir"], tf, config)
+            d = grow_dir(fr["pos"], fr["dir"], tf, config, rng)
             np_pos = fr["pos"] + d * step_m
 
-            if not (0 < np_pos[0] < config.map_width_m and
-                    0 < np_pos[1] < config.map_height_m):
+            if not (0 < np_pos[0] < config.map_width_m and 0 < np_pos[1] < config.map_height_m):
                 fr["alive"] = False
                 continue
 
@@ -222,11 +263,13 @@ def close_endpoints(G, road_field, config):
     # Find G1 endpoints
     deg1 = set()
     for u, v, d in G.edges(data=True):
-        if d.get("level", 0) != 1: continue
+        if d.get("level", 0) != 1:
+            continue
         for n in (u, v):
             if G.degree(n) == 1:
                 deg1.add(n)
-    if not deg1: return G
+    if not deg1:
+        return G
 
     max_dist = config.snap_radius_m * 4.0
     max_edges = min(80, len(deg1))
@@ -235,29 +278,35 @@ def close_endpoints(G, road_field, config):
     # Build candidates sorted by distance
     cand = []
     for ep in sorted(deg1):
-        if ep in connected: continue
+        if ep in connected:
+            continue
         p_ep = G.nodes[ep]["pos"]
         p_set = set()
         for u, v in G.edges(ep):
-            p_set.add((u, v)); p_set.add((v, u))
+            p_set.add((u, v))
+            p_set.add((v, u))
 
-        best_d, best_t, best_cp = float('inf'), None, None
+        best_d, best_t, best_cp = float("inf"), None, None
         for u, v, d in G.edges(data=True):
-            if (u, v) in p_set or (v, u) in p_set: continue
+            if (u, v) in p_set or (v, u) in p_set:
+                continue
             dist = Point(p_ep).distance(d["geom"])
             if dist < best_d:
                 best_d = dist
                 best_t = (u, v)
                 cp = d["geom"].interpolate(d["geom"].project(Point(p_ep)))
                 best_cp = np.asarray(cp.coords[0])
-        if best_t is None or best_d > max_dist: continue
+        if best_t is None or best_d > max_dist:
+            continue
         cand.append((best_d, ep, best_t, best_cp))
 
     cand.sort(key=lambda x: x[0])
 
     for d_ab, ep, (tu, tv), cp in cand:
-        if len(connected) >= max_edges: break
-        if ep in connected: continue
+        if len(connected) >= max_edges:
+            break
+        if ep in connected:
+            continue
 
         # A* if road_field available
         if cost is not None:
@@ -269,7 +318,7 @@ def close_endpoints(G, road_field, config):
                 step_loc = config.g1_step_m / map_m
                 cum = 0.0
                 for k in range(1, len(path)):
-                    ds = float(np.linalg.norm(path[k] - path[k-1]))
+                    ds = float(np.linalg.norm(path[k] - path[k - 1]))
                     cum += ds
                     if cum >= step_loc or k == len(path) - 1:
                         if k == len(path) - 1:
@@ -287,9 +336,11 @@ def close_endpoints(G, road_field, config):
 
         # Fallback: direct line
         cand_line = LineString([G.nodes[ep]["pos"], cp])
-        illegal = any(cand_line.crosses(d["geom"])
-                      for u, v, d in G.edges(data=True) if not ({u, v} & {ep}))
-        if illegal: continue
+        illegal = any(
+            cand_line.crosses(d["geom"]) for u, v, d in G.edges(data=True) if not ({u, v} & {ep})
+        )
+        if illegal:
+            continue
 
         sid = split_e(G, tu, tv, cp)
         if sid is not None and sid != ep:
@@ -309,18 +360,22 @@ def final_merge(G, config):
     h_edges = [(u, v, d) for u, v, d in G.edges(data=True) if d.get("level", 0) == 0]
     g1_nodes = set()
     for u, v, d in G.edges(data=True):
-        if d.get("level", 0) != 1: continue
-        g1_nodes.add(u); g1_nodes.add(v)
+        if d.get("level", 0) != 1:
+            continue
+        g1_nodes.add(u)
+        g1_nodes.add(v)
 
     h_nodes = set()
     for u, v, d in G.edges(data=True):
         if d.get("level", 0) == 0:
-            h_nodes.add(u); h_nodes.add(v)
+            h_nodes.add(u)
+            h_nodes.add(v)
 
     for g1n in sorted(g1_nodes):
-        if g1n in h_nodes: continue
+        if g1n in h_nodes:
+            continue
         pg = G.nodes[g1n]["pos"]
-        best_d, best_info = float('inf'), None
+        best_d, best_info = float("inf"), None
         for hu, hv, hd in h_edges:
             dist = Point(pg).distance(hd["geom"])
             if dist < best_d:
@@ -347,7 +402,8 @@ def final_merge(G, config):
 
 
 def _empty_regs(G, map_m, min_a, res=64):
-    from scipy.ndimage import label, binary_dilation
+    from scipy.ndimage import binary_dilation, label
+
     cm = map_m / res
     occ = np.zeros((res, res), dtype=bool)
     for _, _, d in G.edges(data=True):
@@ -363,50 +419,77 @@ def _empty_regs(G, map_m, min_a, res=64):
     regs = []
     for li in range(1, nl + 1):
         mask = lab == li
-        a = float(mask.sum()) * cm ** 2
-        if a < min_a: continue
+        a = float(mask.sum()) * cm**2
+        if a < min_a:
+            continue
         ys, xs = np.where(mask)
-        regs.append((np.array([float(np.mean(ys)) * cm, float(np.mean(xs)) * cm]),
-                     float(ys.max() - ys.min() + 1) * cm,
-                     float(xs.max() - xs.min() + 1) * cm))
+        regs.append(
+            (
+                np.array([float(np.mean(ys)) * cm, float(np.mean(xs)) * cm]),
+                float(ys.max() - ys.min() + 1) * cm,
+                float(xs.max() - xs.min() + 1) * cm,
+            )
+        )
     regs.sort(key=lambda r: -r[1] * r[2])
     return regs
 
 
-def grow_g2(G, tf, config):
+def grow_g2(G, tf, config, rng=None):
     map_m = config.map_width_m
+    if rng is None:
+        rng = random.Random(config.random_seed + 1)
     for _ in range(config.g2_max_cuts_per_pass * 5):
         regs = _empty_regs(G, map_m, config.g2_min_face_area_m2)
-        if not regs: break
+        if not regs:
+            break
         cut = False
         for c, w, h in regs[:3]:
             maj, min_, _ = tf.axes(c)
             d = min_ if w >= h else maj
+            # Style-aware jitter: organic → random cut direction
+            if config.g2_jitter_deg > 0.5:
+                j = math.radians(config.g2_jitter_deg * (rng.random() * 2.0 - 1.0))
+                ca, sa = math.cos(j), math.sin(j)
+                d = normalize(np.array([ca * d[0] - sa * d[1], sa * d[0] + ca * d[1]]))
             hf = min(w, h) * 0.3
-            if hf < config.g2_min_cut_length_m * 0.5: continue
+            if hf < config.g2_min_cut_length_m * 0.5:
+                continue
             p0, p1 = c - d * hf, c + d * hf
-            e0 = _nearest(G, p0); e1 = _nearest(G, p1)
+            e0 = _nearest(G, p0)
+            e1 = _nearest(G, p1)
             n0 = split_e(G, e0[0], e0[1], p0)
             n1 = split_e(G, e1[0], e1[1], p1)
-            if n0 is None: n0 = _nid(G); G.add_node(n0, pos=p0.copy())
-            if n1 is None: n1 = _nid(G); G.add_node(n1, pos=p1.copy())
-            if n0 == n1: continue
+            if n0 is None:
+                n0 = _nid(G)
+                G.add_node(n0, pos=p0.copy())
+            if n1 is None:
+                n1 = _nid(G)
+                G.add_node(n1, pos=p1.copy())
+            if n0 == n1:
+                continue
             mid = (G.nodes[n0]["pos"] + G.nodes[n1]["pos"]) / 2
-            ok = all(Point(mid).distance(ed["geom"]) >= config.snap_radius_m * 0.5
-                     for uu, vv, ed in G.edges(data=True) if not ({uu, vv} & {n0, n1}))
-            if not ok: continue
+            ok = all(
+                Point(mid).distance(ed["geom"]) >= config.snap_radius_m * 0.5
+                for uu, vv, ed in G.edges(data=True)
+                if not ({uu, vv} & {n0, n1})
+            )
+            if not ok:
+                continue
             add_e(G, n0, n1, 2)
-            cut = True; break
-        if not cut: break
+            cut = True
+            break
+        if not cut:
+            break
     return G
 
 
 def _nearest(G, pt):
     p = Point(pt)
-    best, bd = None, float('inf')
+    best, bd = None, float("inf")
     for u, v, d in G.edges(data=True):
         dist = p.distance(d["geom"])
-        if dist < bd: bd, best = dist, (u, v)
+        if dist < bd:
+            bd, best = dist, (u, v)
     return best
 
 
@@ -415,17 +498,22 @@ def _nearest(G, pt):
 
 def grow(coords_m, ei, nt, road_field, config):
     G = to_graph(coords_m, ei, nt, level=0)
-    tf = GraphTensorField.from_h_graph(coords_m, ei,
-                                        step_m=config.tensor_sample_step_m,
-                                        radius_m=config.tensor_radius_m,
-                                        sigma_m=config.tensor_sigma_m)
+    tf = GraphTensorField.from_h_graph(
+        coords_m,
+        ei,
+        step_m=config.tensor_sample_step_m,
+        radius_m=config.tensor_radius_m,
+        sigma_m=config.tensor_sigma_m,
+        tangent_smooth_radius=config.tensor_smooth_radius_m,
+    )
+    rng = random.Random(config.random_seed)
     # G1: full coverage growth from H edges (seeds split H edges)
-    G = grow_g1(G, tf, config)
+    G = grow_g1(G, tf, config, rng)
     # A* endpoint closure
     if road_field is not None:
         G = close_endpoints(G, road_field, config)
     # G2: face infill on raw G1 topology
-    G = grow_g2(G, tf, config)
+    G = grow_g2(G, tf, config, rng)
     # Final cleanup: snap G1 nodes to H edges
     G = final_merge(G, config)
     return to_dict(G, config.map_width_m)
@@ -433,7 +521,6 @@ def grow(coords_m, ei, nt, road_field, config):
 
 def assign_attributes(graph: dict, config) -> dict:
     """Add per-edge attributes: lanes, bidirectional, speed, surface."""
-    from .config import GrowthConfig
     rc = graph.get("road_class", np.ones(len(graph["edge_index"]), dtype=np.int64))
     E = len(graph["edge_index"])
 

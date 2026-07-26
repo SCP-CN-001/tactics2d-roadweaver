@@ -210,7 +210,9 @@ def polylines_to_binary_mask(
     pad = raw_size * padding_ratio
     x_min -= pad
     y_min -= pad
-    size = max(x_max - x_min, y_max - y_min, 1.0) + 2 * pad
+    x_max += pad
+    y_max += pad
+    size = max(x_max - x_min, y_max - y_min, 1.0)
 
     # 2. Render each polyline segment
     mask = np.zeros((resolution, resolution), dtype=np.uint8)

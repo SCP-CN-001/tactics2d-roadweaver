@@ -3,6 +3,7 @@ Pathfinding on road field: A*, road snapping, path sampling at intervals.
 
 All coordinates are in [0, 1] normalized space unless specified as pixels.
 """
+
 from __future__ import annotations
 
 import heapq
@@ -11,9 +12,9 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 
 
-def cost_map_from_road(road_field: np.ndarray,
-                       cost_mult: float = 4.0,
-                       cost_bias: float = 0.3) -> np.ndarray:
+def cost_map_from_road(
+    road_field: np.ndarray, cost_mult: float = 4.0, cost_bias: float = 0.3
+) -> np.ndarray:
     """Build A* cost map from road probability field.
 
     Higher road probability = lower cost.  The formula
@@ -21,15 +22,15 @@ def cost_map_from_road(road_field: np.ndarray,
     gives a smooth gradient where road pixels cost ~*bias* and
     off-road pixels cost ~*mult + bias*.
     """
-    return np.clip((1.0 - road_field) * cost_mult + cost_bias,
-                   cost_bias, cost_mult + cost_bias)
+    return np.clip((1.0 - road_field) * cost_mult + cost_bias, cost_bias, cost_mult + cost_bias)
 
 
-def nearest_road_px(px: int, py: int, road_field: np.ndarray,
-                    radius: int = 5, threshold: float = 0.3) -> Tuple[int, int]:
+def nearest_road_px(
+    px: int, py: int, road_field: np.ndarray, radius: int = 5, threshold: float = 0.3
+) -> tuple[int, int]:
     """Find nearest pixel with road_field > threshold within *radius*."""
     H, W = road_field.shape[:2]
-    best_d, best_p = float('inf'), (px, py)
+    best_d, best_p = float("inf"), (px, py)
     for dy in range(-radius, radius + 1):
         for dx in range(-radius, radius + 1):
             nx2, ny2 = px + dx, py + dy
@@ -40,9 +41,9 @@ def nearest_road_px(px: int, py: int, road_field: np.ndarray,
     return best_p
 
 
-def astar_grid(sx: int, sy: int, gx: int, gy: int,
-               cost_map: np.ndarray, max_steps: int = 10000
-               ) -> Optional[np.ndarray]:
+def astar_grid(
+    sx: int, sy: int, gx: int, gy: int, cost_map: np.ndarray, max_steps: int = 10000
+) -> np.ndarray | None:
     """A* on a grid cost map from (sx, sy) to (gx, gy) (pixel coords).
 
     Returns an (M, 2) array of normalized (x/W, y/H) waypoints, or None
@@ -55,12 +56,13 @@ def astar_grid(sx: int, sy: int, gx: int, gy: int,
 
     if abs(sx - gx) + abs(sy - gy) < 4:
         # Straight line for very short gaps
-        return np.linspace([sx / W, sy / H], [gx / W, gy / H],
-                           max(3, int(np.hypot(gx - sx, gy - sy))))
+        return np.linspace(
+            [sx / W, sy / H], [gx / W, gy / H], max(3, int(np.hypot(gx - sx, gy - sy)))
+        )
 
-    open_set: List[Tuple[float, int, int, int]] = []
-    gs: Dict[Tuple[int, int], float] = {}
-    cf: Dict[Tuple[int, int], Tuple[int, int]] = {}
+    open_set: list[tuple[float, int, int, int]] = []
+    gs: dict[tuple[int, int], float] = {}
+    cf: dict[tuple[int, int], tuple[int, int]] = {}
     gs[(sx, sy)] = 0.0
     ctr = [0]
     heapq.heappush(open_set, (0.0, 0, sx, sy))
@@ -76,8 +78,7 @@ def astar_grid(sx: int, sy: int, gx: int, gy: int,
             path.append((sx / W, sy / H))
             return np.array(path[::-1], dtype=np.float32)
 
-        for dx, dy in [(1, 0), (-1, 0), (0, 1), (0, -1),
-                       (1, 1), (-1, 1), (1, -1), (-1, -1)]:
+        for dx, dy in [(1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (-1, 1), (1, -1), (-1, -1)]:
             nx, ny = cx + dx, cy + dy
             if nx < 0 or nx >= W or ny < 0 or ny >= H:
                 continue
@@ -94,10 +95,15 @@ def astar_grid(sx: int, sy: int, gx: int, gy: int,
     return None
 
 
-def astar_connect_path(src_norm: np.ndarray, tgt_norm: np.ndarray,
-                       road_field: np.ndarray, cost_map: np.ndarray,
-                       W: int, H: int,
-                       max_steps: int = 10000) -> Optional[np.ndarray]:
+def astar_connect_path(
+    src_norm: np.ndarray,
+    tgt_norm: np.ndarray,
+    road_field: np.ndarray,
+    cost_map: np.ndarray,
+    W: int,
+    H: int,
+    max_steps: int = 10000,
+) -> np.ndarray | None:
     """A* from *src_norm* to *tgt_norm* with road snapping at both ends.
 
     Both coordinates are in [0, 1] normalized space.  The source is snapped
@@ -134,7 +140,7 @@ def astar_connect_path(src_norm: np.ndarray, tgt_norm: np.ndarray,
     return np.array(path_list, dtype=np.float32)
 
 
-def sample_path_at_step(path: np.ndarray, step_sz: float) -> List[np.ndarray]:
+def sample_path_at_step(path: np.ndarray, step_sz: float) -> list[np.ndarray]:
     """Walk *path* (M, 2) and pick waypoints at ~*step_sz* intervals.
 
     Always includes the first and last points.  Returns a list of (2,) arrays.
@@ -152,8 +158,9 @@ def sample_path_at_step(path: np.ndarray, step_sz: float) -> List[np.ndarray]:
     return [path[i].reshape(-1) for i in idx]
 
 
-def line_field_support(a: np.ndarray, b: np.ndarray, field: np.ndarray,
-                       n_samples: int = 8, r_px: int = 3) -> float:
+def line_field_support(
+    a: np.ndarray, b: np.ndarray, field: np.ndarray, n_samples: int = 8, r_px: int = 3
+) -> float:
     """Average road field value along line a→b within a perpendicular band."""
     H, W = field.shape
     vals = []

@@ -121,7 +121,12 @@ def main():
 
     # ── Frozen VQ-VAE ──
     print("[Train] Loading frozen VQ-VAE...")
-    vq = VQVAE(resolution=resolution, num_codes=num_codes, code_map_size=code_map_hw).to(device)
+    vq = VQVAE(
+        resolution=resolution,
+        num_codes=num_codes,
+        code_map_size=code_map_hw,
+        embed_dim=cfg.get("embed_dim", 64),
+    ).to(device)
     vq.eval()
     for p in vq.parameters():
         p.requires_grad = False

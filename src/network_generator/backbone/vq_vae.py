@@ -245,7 +245,7 @@ class VQVAE(nn.Module):
         for ch in channels:
             layers.extend(
                 [
-                    nn.Conv2d(prev, ch, 4, stride=2, padding=1),
+                    nn.Conv2d(prev, ch, 3, stride=2, padding=1),
                     nn.BatchNorm2d(ch),
                     nn.ReLU(inplace=True),
                     ResBlock(ch),

@@ -3,6 +3,7 @@ Graph utility operations: adjacency, components, chain simplification, node merg
 
 All functions operate on normalized [0, 1] graph coordinates unless noted.
 """
+
 from __future__ import annotations
 
 from collections import defaultdict
@@ -11,24 +12,22 @@ from typing import Dict, List, Optional, Set, Tuple
 import numpy as np
 
 
-def adjacency_from_edges(edge_index: np.ndarray, N: int
-                         ) -> Dict[int, List[int]]:
+def adjacency_from_edges(edge_index: np.ndarray, N: int) -> dict[int, list[int]]:
     """Build {node_id: [neighbor_ids]} from an (E, 2) edge array."""
-    adj: Dict[int, List[int]] = defaultdict(list)
+    adj: dict[int, list[int]] = defaultdict(list)
     for u, v in edge_index:
         adj[int(u)].append(int(v))
         adj[int(v)].append(int(u))
     return adj
 
 
-def find_components(adj: Dict[int, List[int]],
-                    node_count: Optional[int] = None) -> List[Set[int]]:
+def find_components(adj: dict[int, list[int]], node_count: int | None = None) -> list[set[int]]:
     """Return a list of connected-component sets."""
     all_nodes = set(adj.keys())
     if node_count is not None:
         all_nodes.update(range(node_count))
-    visited: Set[int] = set()
-    comps: List[Set[int]] = []
+    visited: set[int] = set()
+    comps: list[set[int]] = []
     for i in sorted(all_nodes):
         if i in visited:
             continue
@@ -46,36 +45,35 @@ def find_components(adj: Dict[int, List[int]],
     return comps
 
 
-def components_with_edges(coords: np.ndarray, edge_index: np.ndarray
-                          ) -> List[Set[int]]:
+def components_with_edges(coords: np.ndarray, edge_index: np.ndarray) -> list[set[int]]:
     """Find connected components from graph data directly."""
     adj = adjacency_from_edges(edge_index, len(coords))
     return find_components(adj, len(coords))
 
 
-def component_of_nodes(coords: np.ndarray, edge_index: np.ndarray
-                       ) -> Dict[int, int]:
+def component_of_nodes(coords: np.ndarray, edge_index: np.ndarray) -> dict[int, int]:
     """Return {node_id: component_id}."""
     comps = components_with_edges(coords, edge_index)
-    comp_of: Dict[int, int] = {}
+    comp_of: dict[int, int] = {}
     for ci, cl in enumerate(comps):
         for n in cl:
             comp_of[n] = ci
     return comp_of
 
 
-def endpoint_nodes(adj: Dict[int, List[int]]) -> List[int]:
+def endpoint_nodes(adj: dict[int, list[int]]) -> list[int]:
     """Return list of node IDs with degree == 1."""
     return [i for i, nbrs in adj.items() if len(nbrs) == 1]
 
 
-def simplify_chains(coords: np.ndarray, edge_index: np.ndarray,
-                    force_keep: Optional[Set[int]] = None,
-                    angle_threshold_deg: float = 30.0,
-                    dp_epsilon_norm: float = 0.0,
-                    max_seg_len_norm: float = 0.04
-                    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray,
-                               Dict[int, int], Dict[Tuple[int, int], float]]:
+def simplify_chains(
+    coords: np.ndarray,
+    edge_index: np.ndarray,
+    force_keep: set[int] | None = None,
+    angle_threshold_deg: float = 30.0,
+    dp_epsilon_norm: float = 0.0,
+    max_seg_len_norm: float = 0.04,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[int, int], dict[tuple[int, int], float]]:
     """Collapse degree-2 chains into single edges.
 
     When *angle_threshold_deg* > 0, degree-2 nodes where the turning angle
@@ -96,7 +94,7 @@ def simplify_chains(coords: np.ndarray, edge_index: np.ndarray,
 
     deg = {i: len(adj[i]) for i in range(N)}
 
-    keep: Set[int] = {i for i in range(N) if deg[i] != 2}
+    keep: set[int] = {i for i in range(N) if deg[i] != 2}
     if force_keep:
         keep.update(force_keep)
     if not keep:
@@ -105,11 +103,11 @@ def simplify_chains(coords: np.ndarray, edge_index: np.ndarray,
     klist = sorted(keep)
     old2new = {o: n for n, o in enumerate(klist)}
     simp_coords = [coords[i] for i in klist]  # list for dynamic append
-    curve_newids: Set[int] = set()  # new indices of curve-split points
+    curve_newids: set[int] = set()  # new indices of curve-split points
 
     # Build simplified adjacency + track chain lengths
-    simp_adj: Dict[int, Set[int]] = defaultdict(set)
-    chain_lengths: Dict[Tuple[int, int], float] = {}
+    simp_adj: dict[int, set[int]] = defaultdict(set)
+    chain_lengths: dict[tuple[int, int], float] = {}
 
     def _walk_chain(start: int, first_nb: int):
         """Walk a degree-2 chain, splitting at sharp turns."""
@@ -194,8 +192,8 @@ def simplify_chains(coords: np.ndarray, edge_index: np.ndarray,
             elif len(bs) == 1:
                 pass  # endpoint, skip
         # Collect continuous deg-2 chains
-        visited_dp: Set[int] = set()
-        to_remove: Set[int] = set()
+        visited_dp: set[int] = set()
+        to_remove: set[int] = set()
         for start in list(simp_deg2.keys()):
             if start in visited_dp:
                 continue
@@ -263,8 +261,8 @@ def simplify_chains(coords: np.ndarray, edge_index: np.ndarray,
             remap = {o: n for n, o in enumerate(keep_ids)}
             simp_coords = np.array([simp_coords[i] for i in keep_ids], dtype=np.float32)
             curve_newids = {remap[i] for i in curve_newids if i not in to_remove}
-            new_adj: Dict[int, Set[int]] = defaultdict(set)
-            new_chain_lengths: Dict[Tuple[int, int], float] = {}
+            new_adj: dict[int, set[int]] = defaultdict(set)
+            new_chain_lengths: dict[tuple[int, int], float] = {}
             for a in list(simp_adj.keys()):
                 if a in to_remove:
                     continue
@@ -282,11 +280,11 @@ def simplify_chains(coords: np.ndarray, edge_index: np.ndarray,
                         if key not in new_chain_lengths:
                             new_chain_lengths[key] = chain_lengths.get(
                                 (min(a, b), max(a, b)),
-                                float(np.linalg.norm(simp_coords[na] - simp_coords[nb])))
+                                float(np.linalg.norm(simp_coords[na] - simp_coords[nb])),
+                            )
             simp_adj = new_adj
             chain_lengths = new_chain_lengths
-            old2new = {k: remap[v] for k, v in old2new.items()
-                       if v in remap and v not in to_remove}
+            old2new = {k: remap[v] for k, v in old2new.items() if v in remap and v not in to_remove}
 
     simp_coords = np.array(simp_coords, dtype=np.float32)
 
@@ -295,8 +293,11 @@ def simplify_chains(coords: np.ndarray, edge_index: np.ndarray,
         for b in bset:
             if a < b:
                 simp_edges_list.append([a, b])
-    simp_edges = np.array(simp_edges_list, dtype=np.int64).reshape(-1, 2) \
-                 if simp_edges_list else np.empty((0, 2), dtype=np.int64)
+    simp_edges = (
+        np.array(simp_edges_list, dtype=np.int64).reshape(-1, 2)
+        if simp_edges_list
+        else np.empty((0, 2), dtype=np.int64)
+    )
 
     simp_types_list = []
     for o in sorted(old2new.keys()):
@@ -311,19 +312,25 @@ def simplify_chains(coords: np.ndarray, edge_index: np.ndarray,
         else:
             simp_types_list.append(4)  # endpoint
 
-    return (simp_coords, simp_edges,
-            np.array(simp_types_list, dtype=np.int64), old2new, chain_lengths)
+    return (
+        simp_coords,
+        simp_edges,
+        np.array(simp_types_list, dtype=np.int64),
+        old2new,
+        chain_lengths,
+    )
 
 
-def merge_close_nodes(coords: np.ndarray, edge_index: np.ndarray,
-                      node_types: np.ndarray,
-                      merge_dist: float,
-                      map_size_m: float = 5000.0,
-                      dp_epsilon_norm: float = 0.002,
-                      max_graph_hops: int = 1,
-                      closure_edges: Optional[np.ndarray] = None
-                      ) -> Tuple[np.ndarray, np.ndarray, np.ndarray,
-                                 Optional[np.ndarray], Dict[int, int]]:
+def merge_close_nodes(
+    coords: np.ndarray,
+    edge_index: np.ndarray,
+    node_types: np.ndarray,
+    merge_dist: float,
+    map_size_m: float = 5000.0,
+    dp_epsilon_norm: float = 0.002,
+    max_graph_hops: int = 1,
+    closure_edges: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray | None, dict[int, int]]:
     """Type-aware node merging with graph-distance constraint.
 
     When *closure_edges* is provided, the old-style (coords, edges, types,
@@ -354,12 +361,12 @@ def merge_close_nodes(coords: np.ndarray, edge_index: np.ndarray,
         return coords, edge_index, node_types, None, {i: i for i in range(N)}
 
     # Build graph adjacency (from edges) and proximity adjacency
-    graph_adj: Dict[int, Set[int]] = {i: set() for i in range(N)}
+    graph_adj: dict[int, set[int]] = {i: set() for i in range(N)}
     for u, v in edge_index:
         graph_adj[int(u)].add(int(v))
         graph_adj[int(v)].add(int(u))
 
-    prox_adj: Dict[int, Set[int]] = {i: set() for i in range(N)}
+    prox_adj: dict[int, set[int]] = {i: set() for i in range(N)}
     for i in range(N):
         for j in range(i + 1, N):
             if np.linalg.norm(coords[i] - coords[j]) < merge_dist:
@@ -406,8 +413,8 @@ def merge_close_nodes(coords: np.ndarray, edge_index: np.ndarray,
         return True
 
     # Proximity clusters
-    visited: Set[int] = set()
-    clusters: List[List[int]] = []
+    visited: set[int] = set()
+    clusters: list[list[int]] = []
     for i in range(N):
         if i in visited:
             continue
@@ -428,9 +435,9 @@ def merge_close_nodes(coords: np.ndarray, edge_index: np.ndarray,
             return coords, edge_index, node_types, closure_edges, {i: i for i in range(N)}
         return coords, edge_index, node_types, None, {i: i for i in range(N)}
 
-    old2new: Dict[int, int] = {}
-    new_coords_list: List[np.ndarray] = []
-    new_types_list: List[int] = []
+    old2new: dict[int, int] = {}
+    new_coords_list: list[np.ndarray] = []
+    new_types_list: list[int] = []
 
     for cl in clusters:
         if len(cl) == 1:
@@ -521,32 +528,40 @@ def merge_close_nodes(coords: np.ndarray, edge_index: np.ndarray,
     merged_coords = np.array(new_coords_list, dtype=np.float32)
     merged_types = np.array(new_types_list, dtype=np.int64)
 
-    edge_set: Set[Tuple[int, int]] = set()
+    edge_set: set[tuple[int, int]] = set()
     for u, v in edge_index:
         nu, nv = old2new[int(u)], old2new[int(v)]
         if nu != nv:
             edge_set.add((nu, nv) if nu < nv else (nv, nu))
-    merged_edges = np.array(list(edge_set), dtype=np.int64).reshape(-1, 2) \
-                   if edge_set else np.empty((0, 2), dtype=np.int64)
+    merged_edges = (
+        np.array(list(edge_set), dtype=np.int64).reshape(-1, 2)
+        if edge_set
+        else np.empty((0, 2), dtype=np.int64)
+    )
 
     if closure_edges is not None:
-        ce_list: List[Tuple[int, int]] = []
+        ce_list: list[tuple[int, int]] = []
         for a, b in closure_edges:
             na, nb = old2new.get(int(a)), old2new.get(int(b))
             if na is not None and nb is not None and na != nb:
                 ce_list.append((na, nb) if na < nb else (nb, na))
         ce_set = set(ce_list)
-        merged_ce = np.array(list(ce_set), dtype=np.int64).reshape(-1, 2) \
-                    if ce_set else np.empty((0, 2), dtype=np.int64)
+        merged_ce = (
+            np.array(list(ce_set), dtype=np.int64).reshape(-1, 2)
+            if ce_set
+            else np.empty((0, 2), dtype=np.int64)
+        )
         return merged_coords, merged_edges, merged_types, merged_ce, old2new
 
     return merged_coords, merged_edges, merged_types, None, old2new
 
 
-def estimate_local_spacing(coords: np.ndarray, edge_index: np.ndarray,
-                           map_size_m: float = 2000.0,
-                           n_samples_per_edge: int = 5
-                           ) -> np.ndarray:
+def estimate_local_spacing(
+    coords: np.ndarray,
+    edge_index: np.ndarray,
+    map_size_m: float = 2000.0,
+    n_samples_per_edge: int = 5,
+) -> np.ndarray:
     """Estimate local road spacing s(x) for each edge in metres.
 
     For each edge, samples points along its polyline and measures
@@ -567,7 +582,7 @@ def estimate_local_spacing(coords: np.ndarray, edge_index: np.ndarray,
         return np.full(E, map_size_m * 0.1, dtype=np.float32)
 
     # Build per-edge adjacency for incident check
-    adj: Dict[int, Set[int]] = defaultdict(set)
+    adj: dict[int, set[int]] = defaultdict(set)
     for u, v in edge_index:
         adj[int(u)].add(int(v))
         adj[int(v)].add(int(u))
@@ -581,11 +596,10 @@ def estimate_local_spacing(coords: np.ndarray, edge_index: np.ndarray,
         if edge_len < 1e-8:
             continue
 
-        samples = [p_u + t * (p_v - p_u)
-                   for t in np.linspace(0.1, 0.9, n_samples_per_edge)]
+        samples = [p_u + t * (p_v - p_u) for t in np.linspace(0.1, 0.9, n_samples_per_edge)]
         dists = []
         for pt in samples:
-            best_d = float('inf')
+            best_d = float("inf")
             for ej, (a, b) in enumerate(edge_index):
                 if ej == ei:
                     continue
@@ -603,7 +617,7 @@ def estimate_local_spacing(coords: np.ndarray, edge_index: np.ndarray,
                 d = float(np.linalg.norm(pt - cp))
                 if d < best_d:
                     best_d = d
-            if best_d < float('inf'):
+            if best_d < float("inf"):
                 dists.append(best_d)
         if dists:
             spacing[ei] = float(np.median(dists)) * map_size_m
@@ -615,18 +629,21 @@ def estimate_local_spacing(coords: np.ndarray, edge_index: np.ndarray,
 
 # ─── Node type constants ───────────────────────────────────────────────
 
-NT_WAYPOINT = 0       # deg=2, straight through
-NT_JUNCTION = 1       # deg >= 3
-NT_CURVE = 2          # deg=2, sharp turn (preserved shape point)
-NT_ROUNDABOUT = 3     # part of a detected roundabout cycle
-NT_ENDPOINT = 4       # deg <= 1
+NT_WAYPOINT = 0  # deg=2, straight through
+NT_JUNCTION = 1  # deg >= 3
+NT_CURVE = 2  # deg=2, sharp turn (preserved shape point)
+NT_ROUNDABOUT = 3  # part of a detected roundabout cycle
+NT_ENDPOINT = 4  # deg <= 1
 
 
-def detect_roundabouts(coords: np.ndarray, edge_index: np.ndarray,
-                        node_types: np.ndarray,
-                        map_size_m: float = 5000.0,
-                        max_cycle_size: int = 80,
-                        skip_area_check: bool = False) -> np.ndarray:
+def detect_roundabouts(
+    coords: np.ndarray,
+    edge_index: np.ndarray,
+    node_types: np.ndarray,
+    map_size_m: float = 5000.0,
+    max_cycle_size: int = 80,
+    skip_area_check: bool = False,
+) -> np.ndarray:
     """Detect roundabout cycles and return updated node_types with NT_ROUNDABOUT set.
 
     Filters:
@@ -648,7 +665,6 @@ def detect_roundabouts(coords: np.ndarray, edge_index: np.ndarray,
         updated node_types with roundabout nodes marked as NT_ROUNDABOUT (3).
     """
     import networkx as nx
-    import math
 
     N = len(coords)
     G = nx.Graph()
@@ -719,5 +735,3 @@ def detect_roundabouts(coords: np.ndarray, edge_index: np.ndarray,
             types[n] = NT_ROUNDABOUT
 
     return types
-
-

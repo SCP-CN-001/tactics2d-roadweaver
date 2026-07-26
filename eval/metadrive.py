@@ -21,9 +21,7 @@ Output:
         topology.json          — topological validity results
         route_coverage.json    — route coverage results
         geometry.json          — geometric validity results
-        scalability.json       — scalability results
-        scalability.csv        — CSV for plotting
-        paper_tables/          — LaTeX table rows
+        scalability.csv        — scalability data
 """
 
 from __future__ import annotations
@@ -35,6 +33,7 @@ from pathlib import Path
 
 import networkx as nx
 import numpy as np
+from tqdm import tqdm
 
 from eval.metrics import (
     classify_scale,
@@ -42,15 +41,17 @@ from eval.metrics import (
     compute_route_coverage,
     compute_topological_metrics,
     extract_intersection_graph,
+    get_resource_stats,
+    is_metadrive_road_node,
     load_osm_reference_degree,
     print_results_table,
     save_results,
-    save_tex_row,
+    save_system_info,
 )
 from eval.polyline_graph import polylines_to_graph, save_vis
 
 # Ensure the metadrive submodule is importable (shadows pip package)
-_metadrive_path = Path(__file__).resolve().parent.parent / "metadrive"
+_metadrive_path = Path(__file__).resolve().parent.parent / "baselines" / "MetaDrive"
 if _metadrive_path.exists() and str(_metadrive_path) not in __import__("sys").path:
     __import__("sys").path.insert(0, str(_metadrive_path))
 
@@ -98,11 +99,12 @@ def generate_metadrive_map(seed: int, map_config: int = 7, graph_method: str = "
     gen_time = time.time() - t0
 
     # Extract lane geometry polylines (used by both methods)
+    # Filter out decoration/edge nodes (">", "->", etc.) using naming pattern
     rn = env.engine.current_map.road_network
     polylines = []
     for sn, td in rn.graph.items():
         for en, lanes in td.items():
-            if sn == "decoration" or en == "decoration":
+            if not is_metadrive_road_node(sn) or not is_metadrive_road_node(en):
                 continue
             for lane in lanes:
                 try:
@@ -149,7 +151,7 @@ def run_topology_eval(
 ) -> dict:
     """Generate maps and compute topological validity metrics."""
     print(f"\n{'=' * 60}")
-    print("Section 1: Topological Validity")
+    print("Section 1: Topological Validity  (MetaDrive)")
     print(
         f"  Generating {num_maps} maps (map={map_config}, seed={seed}, " f"graph={graph_method})..."
     )
@@ -220,13 +222,6 @@ def run_topology_eval(
     agg["osm_reference_avg_degree"] = ref_deg
 
     save_results(output_dir, "topology", agg, all_results)
-    save_tex_row(
-        output_dir,
-        "topological-validity",
-        "MetaDrive",
-        agg,
-        fields=[("lcc", ".3f"), ("dead_end_ratio", ".3f"), ("delta_avg_degree", ".3f")],
-    )
     print_results_table(
         "Topological Validity",
         agg,
@@ -256,7 +251,7 @@ def run_route_eval(
 ) -> dict:
     """Generate maps and compute route coverage metrics."""
     print(f"\n{'=' * 60}")
-    print("Section 2: Route-Level Coverage")
+    print("Section 2: Route-Level Coverage  (MetaDrive)")
     print(f"  Generating {num_maps} maps, {n_pairs} OD pairs each " f"(graph={graph_method})...")
     print(f"{'=' * 60}")
 
@@ -295,13 +290,6 @@ def run_route_eval(
     agg["n_maps"] = len(all_results)
 
     save_results(output_dir, "route_coverage", agg, all_results)
-    save_tex_row(
-        output_dir,
-        "route-coverage",
-        "MetaDrive",
-        agg,
-        fields=[("reachable_ratio", ".3f"), ("avg_route_length", ".1f")],
-    )
     print_results_table(
         "Route Coverage",
         agg,
@@ -325,7 +313,7 @@ def run_geometry_eval(
 ) -> dict:
     """Generate maps and compute all geometric metrics from lane polylines."""
     print(f"\n{'=' * 60}")
-    print("Section 3: Geometric Validity")
+    print("Section 3: Geometric Validity  (MetaDrive)")
     print(f"  Generating {num_maps} maps (graph={graph_method})...")
     print(f"{'=' * 60}")
 
@@ -356,7 +344,7 @@ def run_geometry_eval(
         if (i + 1) % 50 == 0:
             print(
                 f"    [{i + 1}/{num_maps}] "
-                f"chamfer_self={np.mean(geom_metrics['chamfer_self']):.4f}"
+                f"chamfer_loo={np.mean(geom_metrics['chamfer_loo']):.4f}"
             )
 
     agg = {}
@@ -366,24 +354,11 @@ def run_geometry_eval(
     agg["n_maps"] = len(all_results)
 
     save_results(output_dir, "geometry", agg, all_results)
-    save_tex_row(
-        output_dir,
-        "geometric-validity",
-        "MetaDrive",
-        agg,
-        fields=[
-            ("chamfer_self", ".4f"),
-            ("endpoint_alignment", ".4f"),
-            ("mean_turning_angle_deg", ".2f"),
-            ("mean_edge_length", ".4f"),
-            ("cv_edge_length", ".3f"),
-        ],
-    )
     print_results_table(
         "Geometric Validity",
         agg,
         [
-            ("chamfer_self", "Chamfer (self)", ".4f"),
+            ("chamfer_loo", "Chamfer (LOO)", ".4f"),
             ("endpoint_alignment", "Endpoint Align", ".4f"),
             ("mean_turning_angle_deg", "Turning Angle", ".2f"),
             ("mean_edge_length", "Edge Length", ".4f"),
@@ -410,7 +385,7 @@ def run_scalability_eval(
 ) -> dict:
     """Generate maps at controlled sizes and record metrics."""
     print(f"\n{'=' * 60}")
-    print("Section 4: Large-Scale Capability")
+    print("Section 4: Large-Scale Capability  (MetaDrive)")
     print(f"  Maps: 10 → 200 nodes, {n_per_size} per size")
     print(f"{'=' * 60}")
 
@@ -419,7 +394,7 @@ def run_scalability_eval(
 
     all_results = []
 
-    for target, map_val in zip(target_nodes, map_values):
+    for target, map_val in tqdm(list(zip(target_nodes, map_values)), desc="Scaling"):
         per_size = {"target_nodes": target, "map_config": map_val, "maps": []}
 
         for i in range(n_per_size):
@@ -459,8 +434,6 @@ def run_scalability_eval(
             f"{per_size['aggregate']['node_count_std']:4.1f}  "
             f"time={per_size['aggregate']['gen_time_mean']:.3f}s"
         )
-
-    save_results(output_dir, "scalability_json", {"results": all_results}, None)
 
     # CSV
     csv_path = output_dir / "scalability.csv"
@@ -517,21 +490,145 @@ def main():
     gm = args.graph_method
     run_all = args.all or not (args.topology or args.route or args.geometry or args.scalability)
 
-    if run_all or args.topology:
-        run_topology_eval(
-            args.num_maps, args.seed, args.map_config, gm, output_dir, vis_dir=vis_dir
-        )
-    if run_all or args.route:
-        run_route_eval(
-            args.num_maps, args.seed, args.map_config, graph_method=gm, output_dir=output_dir
-        )
-    if run_all or args.geometry:
-        run_geometry_eval(args.num_maps, args.seed, args.map_config, gm, output_dir)
-    if run_all or args.scalability:
-        run_scalability_eval(args.n_per_size, graph_method=gm, output_dir=output_dir)
+    init_stats = get_resource_stats()
+    peak_stats = dict(init_stats)
+
+    if run_all:
+        # Multi-config sweep: ensure each 5-node bin (5-60) gets ≥5 maps
+        ref_deg = load_osm_reference_degree()
+        from eval.metrics import compute_all_geometric_metrics
+
+        target_bins = list(range(5, 61, 5))  # [5,10,15,...,60]
+        bin_counts = {b: 0 for b in target_bins}
+
+        def _bin(n):
+            return ((n - 1) // 5) * 5 + 5  # round up to nearest 5
+
+        params = [
+            (3, "small"),
+            (7, "medium"),
+            (10, "medium"),
+            (15, "large"),
+            (20, "large"),
+            (25, "large"),
+        ]
+        per_map = []
+        t0 = time.time()
+
+        for mc, _label in params:
+            for seed in range(200):
+                # Stop when all target bins have ≥5
+                if all(c >= 5 for c in bin_counts.values()):
+                    break
+                try:
+                    r = generate_metadrive_map(seed, map_config=mc, graph_method=gm)
+                    G = r["graph"]
+                except Exception:
+                    continue
+                if G.number_of_nodes() < 2:
+                    continue
+                nb = _bin(G.number_of_nodes())
+                if nb in bin_counts and bin_counts[nb] >= 5:
+                    continue  # this bin already full
+                resource = get_resource_stats()
+                topo = compute_topological_metrics(G, ref_avg_degree=ref_deg)
+                route = compute_route_coverage(G, n_pairs=100, seed=seed)
+                geo = compute_all_geometric_metrics(r["polylines"], G=G)
+                scale = classify_scale(topo["node_count"])
+                if vis_dir is not None:
+                    cnt = len(list(Path(vis_dir).glob(f"md_{scale}_*.png")))
+                    if cnt < 5:
+                        save_vis(
+                            r["polylines"],
+                            G,
+                            str(
+                                Path(vis_dir)
+                                / f"md_{scale}_N{G.number_of_nodes()}E{G.number_of_edges()}_{cnt}.png"
+                            ),
+                        )
+                per_map.append(
+                    {
+                        "map_id": len(per_map),
+                        "seed": seed,
+                        "scale": scale,
+                        "gen_time_s": round(r["generation_time"], 4),
+                        **resource,
+                        **topo,
+                        **route,
+                        **geo,
+                    }
+                )
+                if nb in bin_counts:
+                    bin_counts[nb] += 1
+                if len(per_map) % 10 == 0:
+                    filled = sum(1 for c in bin_counts.values() if c >= 5)
+                    print(f"  [{len(per_map)} maps] bins filled: {filled}/{len(target_bins)}")
+            if all(c >= 5 for c in bin_counts.values()):
+                break
+
+        gen_time = time.time() - t0
+        print(f"  Bin counts: {dict(bin_counts)}")
+        # Save combined CSV
+        import csv
+
+        cols = [
+            "map_id",
+            "scale",
+            "n_nodes",
+            "n_edges",
+            "lcc",
+            "dead_end_ratio",
+            "avg_degree",
+            "delta_avg_degree",
+            "reachable_ratio",
+            "avg_route_length",
+            "chamfer_loo",
+            "chamfer_loo_std",
+            "endpoint_alignment",
+            "mean_turning_angle_deg",
+            "intersection_rate",
+            "mean_edge_length",
+            "cv_edge_length",
+            "total_road_length",
+            "mean_spacing_cv",
+            "mean_angle_deg",
+            "gen_time_s",
+            "cpu_percent",
+            "mem_mb",
+            "gpu_mem_mb",
+        ]
+        key_map = {"n_nodes": "node_count", "n_edges": "edge_count"}
+        with open(output_dir / "all_metrics.csv", "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(cols)
+            for m in per_map:
+                w.writerow([m.get(key_map.get(c, c), "") for c in cols])
+        print(f"  Saved {len(per_map)} maps to {output_dir / 'all_metrics.csv'}")
+        print(f"  Generation: {gen_time:.1f}s total, {gen_time/max(len(per_map),1):.1f}s/map")
+        final_stats = get_resource_stats()
+        for k in peak_stats:
+            peak_stats[k] = max(peak_stats[k], final_stats[k])
+        save_system_info(output_dir, "MetaDrive", init_stats, peak_stats, len(per_map))
+    else:
+        if args.topology:
+            run_topology_eval(
+                args.num_maps, args.seed, args.map_config, gm, output_dir, vis_dir=vis_dir
+            )
+        if args.route:
+            run_route_eval(
+                args.num_maps, args.seed, args.map_config, graph_method=gm, output_dir=output_dir
+            )
+        if args.geometry:
+            run_geometry_eval(args.num_maps, args.seed, args.map_config, gm, output_dir)
+        if args.scalability:
+            run_scalability_eval(args.n_per_size, graph_method=gm, output_dir=output_dir)
+        final_stats = get_resource_stats()
+        for k in peak_stats:
+            peak_stats[k] = max(peak_stats[k], final_stats[k])
+        save_system_info(output_dir, "MetaDrive", init_stats, peak_stats, args.num_maps)
 
     print(f"\n{'=' * 60}")
-    print(f"Results saved to {output_dir}/")
+    print(f"MetaDrive evaluation complete — results in {output_dir}/")
     print(f"{'=' * 60}")
 
 
