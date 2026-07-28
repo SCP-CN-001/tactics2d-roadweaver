@@ -43,6 +43,8 @@ class Generator(nn.Module):
         num_codes: int = 512,
         resolution: int | None = None,
         code_map_size: int | None = None,
+        use_adaln: bool = False,
+        cond_dim: int = 11,
     ):
         super().__init__()
 
@@ -72,7 +74,9 @@ class Generator(nn.Module):
             d_model=d_model,
             num_layers=num_layers,
             nhead=nhead,
+            cond_dim=cond_dim,
             max_seq_len=seq_len,
+            use_adaln=use_adaln,
         ).to(device)
         self.model.eval()
         for p in self.model.parameters():

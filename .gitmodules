@@ -10,3 +10,6 @@
 [submodule "sledge"]
 	path = baselines/SLEDGE
 	url = git@github.com:autonomousvision/sledge.git
+[submodule "tactics2d"]
+	path = tactics2d
+	url = git@github.com:WoodOxen/tactics2d.git

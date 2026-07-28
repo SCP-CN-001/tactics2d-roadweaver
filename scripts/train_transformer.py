@@ -74,11 +74,26 @@ def extract_code_maps(vq, loader, device, code_map_hw=64):
     return codes.numpy(), conds.numpy()
 
 
-def mask_tokens(code_tokens, mask_token_id, min_mask=0.10, max_mask=0.90):
-    """Randomly mask tokens with per-batch variable ratio."""
+def mask_tokens(
+    code_tokens, mask_token_id, min_mask=0.10, max_mask=0.90, epoch=None, max_epochs=None
+):
+    """
+    Randomly mask tokens with curriculum schedule.
+
+    Early epochs use a lower ceiling (easier), later epochs increase
+    the ceiling toward ``max_mask``.  When *epoch* is None the original
+    uniform-random behaviour is preserved.
+    """
     B, S = code_tokens.shape
     labels = code_tokens.clone()
-    mask_ratio = torch.empty(1).uniform_(min_mask, max_mask).item()
+
+    if epoch is not None and max_epochs is not None:
+        progress = min(epoch / max_epochs, 1.0)
+        ceiling = min_mask + (max_mask - min_mask) * progress
+    else:
+        ceiling = max_mask
+
+    mask_ratio = torch.empty(1).uniform_(min_mask, ceiling).item()
     mask = torch.rand(B, S, device=code_tokens.device) < mask_ratio
 
     masked_tokens = code_tokens.clone()
@@ -174,8 +189,8 @@ def main():
         val_ds = CachedCodeMapDataset(val_cache)
 
     if cfg.get("balanced_sampling", False) and len(train_ds) > 0:
-        # Compute class weights from style_vector in conditions
-        classes = train_ds.conditions.argmax(dim=1)  # (N,) style class
+        # Compute class weights from style_vector only (first 6 dims)
+        classes = train_ds.conditions[:, :6].argmax(dim=1)  # (N,) style class
         counts = Counter(classes.tolist())
         weights = [1.0 / counts[c] for c in classes.tolist()]
         sampler = WeightedRandomSampler(weights, len(train_ds), replacement=True)
@@ -204,12 +219,15 @@ def main():
     )
 
     # ── Model ──
+    cond_dim = CONFIG.style_dim + CONFIG.extra_condition_dim  # 6 + 5 = 11
     model = MaskedCodeModel(
         vocab_size=num_codes + 1,
         d_model=cfg.get("d_model", 512),
         num_layers=cfg.get("num_layers", 6),
         nhead=cfg.get("nhead", 8),
+        cond_dim=cond_dim,
         max_seq_len=seq_len,
+        use_adaln=cfg.get("use_adaln", False),
     ).to(device)
     print(
         f"[Train] Transformer: {cfg.get('num_layers',6)} layers, "
@@ -245,12 +263,23 @@ def main():
             codes = batch["code_tokens"].to(device, non_blocking=True)
             cond = batch["condition"].to(device, non_blocking=True)
 
-            masked_codes, labels, mask_ratio = mask_tokens(codes, mask_token_id=model.mask_token_id)
+            epochs_total = cfg.get("epochs", 50)
+            masked_codes, labels, mask_ratio = mask_tokens(
+                codes, mask_token_id=model.mask_token_id, epoch=epoch, max_epochs=epochs_total
+            )
 
             logits = model(masked_codes, cond)
             loss = F.cross_entropy(
                 logits.view(-1, model.vocab_size), labels.view(-1), ignore_index=-100
             )
+
+            # ── Full-mask auxiliary loss (last 20% of training) ──────
+            if epochs_total >= 10 and epoch / epochs_total > 0.8:
+                full_masked = torch.full_like(codes, model.mask_token_id)
+                logits_full = model(full_masked, cond)
+                loss_full = F.cross_entropy(logits_full.view(-1, model.vocab_size), codes.view(-1))
+                loss = loss + 0.2 * loss_full
+            # ──────────────────────────────────────────────────────────
 
             opt.zero_grad(set_to_none=True)
             loss.backward()
@@ -276,7 +305,10 @@ def main():
                 codes = batch["code_tokens"].to(device, non_blocking=True)
                 cond = batch["condition"].to(device, non_blocking=True)
 
-                masked_codes, labels, _ = mask_tokens(codes, mask_token_id=model.mask_token_id)
+                epochs_total = cfg.get("epochs", 50)
+                masked_codes, labels, _ = mask_tokens(
+                    codes, mask_token_id=model.mask_token_id, epoch=epoch, max_epochs=epochs_total
+                )
 
                 logits = model(masked_codes, cond)
                 loss = F.cross_entropy(
@@ -293,6 +325,9 @@ def main():
 
         val_ce /= max(val_tokens, 1)
         val_acc /= max(val_n, 1)
+
+        # Clear GPU cache at the end of each epoch to prevent fragmentation
+        torch.cuda.empty_cache()
 
         # ── Sample quality ──
         sample_iou = 0.0

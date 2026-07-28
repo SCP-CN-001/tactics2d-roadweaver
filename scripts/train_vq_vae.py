@@ -84,6 +84,8 @@ def main():
         embed_dim=cfg.get("embed_dim", 64),
         commitment_cost=cfg.get("commitment_cost", 0.25),
         decay=cfg.get("decay", 0.99),
+        spread_margin=cfg.get("spread_margin", 0.0),
+        spread_weight=cfg.get("spread_weight", 0.0),
     ).to(device)
     print(
         f"[VQ-VAE] Code map: {model.code_map_hw}x{model.code_map_hw}, "
@@ -116,7 +118,7 @@ def main():
             with torch.amp.autocast(device_type="cuda", enabled=(device == "cuda")):
                 recon, _, vq_info = model(target)
                 ls = criterion(recon, target)
-            total = ls["total"] + vq_info["vq_loss"]
+            total = ls["total"] + vq_info["vq_loss"] + vq_info["code_spread_weighted"]
             if not (torch.isnan(total) or torch.isinf(total)):
                 scaler.scale(total).backward()
                 scaler.unscale_(optimizer)
@@ -126,6 +128,7 @@ def main():
                 for k, v in ls.items():
                     losses[k] += v.item() if isinstance(v, torch.Tensor) else v
                 losses["vq_loss"] += vq_info["vq_loss"].item()
+                losses["code_spread_loss"] += vq_info["code_spread_loss"]
                 losses["perplexity"] += vq_info["perplexity"]
                 losses["code_usage"] += vq_info["usage"]
                 n_batches += 1
@@ -144,6 +147,7 @@ def main():
                 for k, v in ls.items():
                     val_ls[k] += v.item() if isinstance(v, torch.Tensor) else v
                 val_ls["vq_loss"] += vq_info["vq_loss"].item()
+                val_ls["code_spread_loss"] += vq_info["code_spread_loss"]
                 val_ls["perplexity"] += vq_info["perplexity"]
                 val_ls["code_usage"] += vq_info["usage"]
                 vn += 1

@@ -19,6 +19,9 @@ Usage:
         compute_all_geometric_metrics,
         save_results,
         load_osm_reference_degree,
+        monitor_resources,
+        load_csv_keys,
+        append_csv_row,
     )
 """
 
@@ -29,6 +32,7 @@ import json
 import re
 import warnings
 from collections import defaultdict
+from contextlib import contextmanager
 from pathlib import Path
 
 import networkx as nx
@@ -1202,6 +1206,113 @@ def get_resource_stats() -> dict[str, float]:
     except Exception:
         pass
     return {"cpu_percent": cpu, "mem_mb": mem, "gpu_mem_mb": gpu}
+
+
+@contextmanager
+def monitor_resources(interval: float = 0.5):
+    """Context manager tracking peak CPU%, memory MB, GPU memory MB.
+
+    Spawns a daemon thread that samples every *interval* seconds during
+    the wrapped block and returns a dict with peak values on exit.
+
+    Usage::
+
+        with monitor_resources() as peaks:
+            generate_map(...)
+        print(peaks["cpu_peak"], peaks["mem_peak_mb"], peaks["gpu_peak_mb"])
+    """
+    import threading
+    import time as _time
+
+    peaks = {"cpu_peak": 0.0, "mem_peak_mb": 0.0, "gpu_peak_mb": 0.0}
+    lock = threading.Lock()
+    running = True
+
+    def _sample():
+        proc = None
+        try:
+            import psutil
+
+            proc = psutil.Process()
+            proc.cpu_percent(interval=0)  # warm-up
+        except ImportError:
+            pass
+
+        while running:
+            _time.sleep(interval)
+            cpu = mem = 0.0
+            if proc is not None:
+                try:
+                    cpu = proc.cpu_percent(interval=0)
+                    mem = proc.memory_info().rss / 1024**2
+                except Exception:
+                    pass
+            gpu = 0.0
+            try:
+                import subprocess
+
+                r = subprocess.run(
+                    ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"],
+                    capture_output=True,
+                    text=True,
+                    timeout=2,
+                )
+                gpu = float(r.stdout.strip().split("\n")[0])
+            except Exception:
+                pass
+            with lock:
+                peaks["cpu_peak"] = max(peaks["cpu_peak"], cpu)
+                peaks["mem_peak_mb"] = max(peaks["mem_peak_mb"], mem)
+                peaks["gpu_peak_mb"] = max(peaks["gpu_peak_mb"], gpu)
+
+    t = threading.Thread(target=_sample, daemon=True)
+    t.start()
+    try:
+        yield peaks
+    finally:
+        running = False
+        t.join(timeout=3)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  CSV resume helpers
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def load_csv_keys(csv_path: Path, key_cols: list[str]) -> set[str]:
+    """Load existing CSV and return set of ``'|'.join(key_cols)`` seen keys.
+
+    Used for resume: before generating a map, check if
+    ``f"{row[col1]}|{row[col2]}"`` is already in the CSV.  If yes, skip it.
+    """
+    if not csv_path.exists():
+        return set()
+    seen: set[str] = set()
+    try:
+        with open(csv_path, newline="") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                parts = [str(row.get(c, "")).strip() for c in key_cols]
+                seen.add("|".join(parts))
+    except Exception:
+        pass
+    return seen
+
+
+def append_csv_row(csv_path: Path, columns: list[str], row: dict):
+    """Append a single row to CSV.  Writes header only if file is new.
+
+    Args:
+        csv_path: Path to the CSV file (append mode).
+        columns: Ordered list of column names.
+        row: Dict of column → value for this row.
+    """
+    is_new = not csv_path.exists()
+    with open(csv_path, "a", newline="") as f:
+        w = csv.writer(f)
+        if is_new:
+            w.writerow(columns)
+        w.writerow([row.get(c, "") for c in columns])
 
 
 def save_system_info(output_dir: Path, label: str, init_stats: dict, peak_stats: dict, n_maps: int):

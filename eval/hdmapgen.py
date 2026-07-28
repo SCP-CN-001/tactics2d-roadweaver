@@ -38,6 +38,7 @@ from scipy.interpolate import CubicSpline
 from tqdm import tqdm
 
 from eval.metrics import (
+    append_csv_row,
     classify_scale,
     compute_all_geometric_metrics,
     compute_route_coverage,
@@ -45,7 +46,9 @@ from eval.metrics import (
     compute_topological_metrics,
     contract_degree2_nodes,
     get_resource_stats,
+    load_csv_keys,
     load_osm_reference_degree,
+    monitor_resources,
     print_results_table,
     save_results,
     save_system_info,
@@ -178,7 +181,9 @@ def _checkpoint_model_dir() -> Path:
 
 
 def regenerate_graphs() -> list[dict]:
-    """Regenerate 610 maps (9-69 nodes, 10 each) using the HDMapGen model."""
+    """Regenerate 610 maps (9-69 nodes, 10 each) using the HDMapGen model.
+    NOTE: Model is architected for max 70 nodes, so 70-80 bins rely on
+    the existing 610-map dataset."""
     print("  Regenerating graphs with HDMapGen model...")
     HDMAPGEN = REPO / "baselines" / "HDMapGen"
     sys.path.insert(0, str(HDMAPGEN))
@@ -589,6 +594,10 @@ def main():
     gm = args.graph_method
     run_all = args.all or not (args.topology or args.route or args.geometry or args.scalability)
 
+    # In --all mode, always save visualizations
+    if run_all and vis_dir is None:
+        vis_dir = output_dir / "vis"
+
     init_stats = get_resource_stats()
     peak_stats = dict(init_stats)
 
@@ -598,22 +607,37 @@ def main():
         print(f"Using existing graphs from {GRAPH_PKL}")
 
     if run_all:
+        output_dir.mkdir(parents=True, exist_ok=True)
         ref_deg = load_osm_reference_degree()
         all_data = pickle.load(open(GRAPH_PKL, "rb"))
         if max_maps > 0:
             all_data = all_data[:max_maps]
-        elif len(all_data) > 610:
-            all_data = all_data  # use all available
-        target_bins = list(range(5, 61, 5))
+
+        target_bins = list(range(10, 81, 5))
         bin_counts = {b: 0 for b in target_bins}
 
         def _bin(n):
             return ((n - 1) // 5) * 5 + 5
 
+        # ── Resume: load existing CSV ─────────────────────────────────────
+        csv_path = output_dir / "all_metrics.csv"
+        seen_keys = load_csv_keys(csv_path, ["pickle_idx"])
+        if seen_keys:
+            print(f"  Resuming: {len(seen_keys)} existing entries loaded from {csv_path.name}")
+
+        existing_count = 0
+        if csv_path.exists():
+            with open(csv_path) as _f:
+                existing_count = max(0, sum(1 for _ in _f) - 1)
+
         per_map = []
         t0 = time.time()
         for idx, entry in enumerate(all_data):
-            if all(c >= 5 for c in bin_counts.values()) and len(per_map) >= len(target_bins) * 5:
+            key = str(idx)
+            if key in seen_keys:
+                continue
+
+            if all(c >= 5 for c in bin_counts.values()):
                 break
             try:
                 G = dict_to_nx(entry, graph_method=gm, scale_to_meters=_HDMAPGEN_METER_SCALE)
@@ -622,20 +646,68 @@ def main():
             if G.number_of_nodes() < 2:
                 continue
             nb = _bin(G.number_of_nodes())
-            if nb in bin_counts and bin_counts[nb] >= 5 and len(per_map) >= len(target_bins) * 5:
+            if nb < target_bins[0]:  # skip small maps (bin 5)
                 continue
-            resource = get_resource_stats()
-            topo = compute_topological_metrics(G, ref_avg_degree=ref_deg)
-            route = compute_route_coverage(G, n_pairs=100, seed=idx)
-            polylines = extract_polylines_from_subnodes(
-                entry, scale_to_meters=_HDMAPGEN_METER_SCALE
-            )
-            raw_polylines = extract_polylines_from_subnodes(
-                entry, interpolate=False, scale_to_meters=_HDMAPGEN_METER_SCALE
-            )
-            geo = compute_all_geometric_metrics(polylines, G=G)
-            geo.update(compute_subnode_uniformity(raw_polylines))
+            if nb in bin_counts and bin_counts[nb] >= 5:
+                continue
+
+            # Single resource monitoring block for all metric computation
+            with monitor_resources(interval=0.3) as peaks:
+                topo = compute_topological_metrics(G, ref_avg_degree=ref_deg)
+                route = compute_route_coverage(G, n_pairs=100, seed=idx)
+                polylines = extract_polylines_from_subnodes(
+                    entry, scale_to_meters=_HDMAPGEN_METER_SCALE
+                )
+                raw_polylines = extract_polylines_from_subnodes(
+                    entry, interpolate=False, scale_to_meters=_HDMAPGEN_METER_SCALE
+                )
+                geo = compute_all_geometric_metrics(polylines, G=G)
+                geo.update(compute_subnode_uniformity(raw_polylines))
+
             scale = classify_scale(topo["node_count"])
+
+            row = {
+                "map_id": existing_count + len(per_map),
+                "pickle_idx": idx,
+                "scale": scale,
+                "n_nodes": topo["node_count"],
+                "n_edges": topo["edge_count"],
+                **{k: topo[k] for k in ("lcc", "dead_end_ratio", "avg_degree", "delta_avg_degree")},
+                **{k: route[k] for k in ("reachable_ratio", "avg_route_length")},
+                **{
+                    k: geo.get(k, "")
+                    for k in (
+                        "chamfer_loo",
+                        "chamfer_loo_std",
+                        "endpoint_alignment",
+                        "mean_turning_angle_deg",
+                        "intersection_rate",
+                        "mean_edge_length",
+                        "cv_edge_length",
+                        "total_road_length",
+                        "mean_spacing_cv",
+                        "mean_angle_deg",
+                    )
+                },
+                "gen_time_s": round(entry["gen_time_s"], 4),
+                "cpu_peak": round(peaks["cpu_peak"], 1),
+                "mem_peak_mb": round(peaks["mem_peak_mb"], 1),
+                "gpu_peak_mb": round(peaks["gpu_peak_mb"], 1),
+            }
+            per_map.append(row)
+            append_csv_row(csv_path, list(row.keys()), row)
+            seen_keys.add(key)
+
+            if nb in bin_counts:
+                bin_counts[nb] += 1
+
+            if len(per_map) % 20 == 0:
+                filled = sum(1 for c in bin_counts.values() if c >= 5)
+                print(
+                    f"  [{existing_count + len(per_map)} maps] bins filled: {filled}/{len(target_bins)}"
+                )
+
+            # ── Vis ──
             if vis_dir is not None:
                 cnt = len(list(Path(vis_dir).glob(f"hd_{scale}_*.png")))
                 if cnt < 5:
@@ -647,61 +719,15 @@ def main():
                             / f"hd_{scale}_N{G.number_of_nodes()}E{G.number_of_edges()}_{cnt}.png"
                         ),
                     )
-            per_map.append(
-                {
-                    "map_id": idx,
-                    "num_nodes": entry["num_nodes"],
-                    "gen_time_s": entry["gen_time_s"],
-                    "scale": scale,
-                    **resource,
-                    **topo,
-                    **route,
-                    **geo,
-                }
-            )
-            if nb in bin_counts:
-                bin_counts[nb] += 1
-        gen_time = time.time() - t0
-        print(f"  Bin counts: {dict(bin_counts)}")
-        import csv
 
-        cols = [
-            "map_id",
-            "scale",
-            "n_nodes",
-            "n_edges",
-            "lcc",
-            "dead_end_ratio",
-            "avg_degree",
-            "delta_avg_degree",
-            "reachable_ratio",
-            "avg_route_length",
-            "chamfer_loo",
-            "chamfer_loo_std",
-            "endpoint_alignment",
-            "mean_turning_angle_deg",
-            "intersection_rate",
-            "mean_edge_length",
-            "cv_edge_length",
-            "total_road_length",
-            "mean_spacing_cv",
-            "mean_angle_deg",
-            "gen_time_s",
-            "cpu_percent",
-            "mem_mb",
-            "gpu_mem_mb",
-        ]
-        key_map = {"n_nodes": "node_count", "n_edges": "edge_count"}
-        with open(output_dir / "all_metrics.csv", "w", newline="") as f:
-            w = csv.writer(f)
-            w.writerow(cols)
-            for m in per_map:
-                w.writerow([m.get(key_map.get(c, c), "") for c in cols])
-        print(f"  Saved {len(per_map)} maps to {output_dir / 'all_metrics.csv'}")
+        gen_time = time.time() - t0
+        n_total = existing_count + len(per_map)
+        print(f"  Bin counts: {dict(bin_counts)}")
+        print(f"  Processed {len(per_map)} new maps (→{n_total} total) in " f"{gen_time:.1f}s")
         final_stats = get_resource_stats()
         for k in peak_stats:
             peak_stats[k] = max(peak_stats[k], final_stats[k])
-        save_system_info(output_dir, "HDMapGen", init_stats, peak_stats, len(per_map))
+        save_system_info(output_dir, "HDMapGen", init_stats, peak_stats, n_total)
     else:
         if args.topology:
             run_topology_eval(gm, output_dir, vis_dir=vis_dir, max_maps=max_maps)

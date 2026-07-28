@@ -595,7 +595,7 @@ def draw_sledge_maps(output_dir: Path = OUTPUT_DIR):
 
         filepath = output_dir / f"sledge_map_{label}.png"
         fig.tight_layout()
-        fig.savefig(filepath, dpi=150, bbox_inches="tight")
+        fig.savefig(filepath, dpi=300, bbox_inches="tight")
         plt.close(fig)
         print(f"  Saved {filepath}")
 

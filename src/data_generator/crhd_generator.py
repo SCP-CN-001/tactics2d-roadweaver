@@ -89,7 +89,7 @@ def graph_from_point(lon: float, lat: float, dist: int = 1000, network_type: str
 
 
 def graph_to_crhd(
-    graph, output_path: str, figsize: tuple[int, int] = (6, 6), dpi: int = 100, fmt: str = "png"
+    graph, output_path: str, figsize: tuple[int, int] = (6, 6), dpi: int = 300, fmt: str = "png"
 ):
     """Render an OSMnx road graph as a CRHD image file."""
     gdf = ox.graph_to_gdfs(graph, nodes=False, edges=True)
@@ -114,7 +114,7 @@ def generate_centroid_crhd(
     output_path: str,
     dist: int = 1000,
     figsize: tuple[int, int] = (6, 6),
-    dpi: int = 100,
+    dpi: int = 300,
     network_type: str = "all",
 ) -> bool:
     """Download OSM data around a point and save a CRHD image."""
@@ -146,7 +146,7 @@ def _render_gdf(
     gdf,
     output_path: str,
     figsize: tuple[float, float] = (5.12, 5.12),
-    dpi: int = 100,
+    dpi: int = 300,
     fmt: str = "png",
     xlim: tuple[float, float] | None = None,
     ylim: tuple[float, float] | None = None,
@@ -181,7 +181,7 @@ def render_crhd_from_cache(
     output_dir: str,
     manifest_path: str | None = None,
     image_size: int = 512,
-    dpi: int = 100,
+    dpi: int = 300,
     limit: int | None = None,
     city_limit: int | None = None,
     skip_existing: bool = False,
@@ -197,7 +197,7 @@ def render_crhd_from_cache(
 
     if context_size > 0:
         render_figsize = (6, 6)
-        render_dpi = 100
+        render_dpi = 300
     else:
         render_figsize = (image_size / dpi, image_size / dpi)
         render_dpi = dpi
@@ -338,7 +338,7 @@ def render_city_wide_crhd(
     manifest_path: str | None = None,
     context_size: int = 7500,
     image_size: int = 1200,
-    dpi: int = 100,
+    dpi: int = 300,
     skip_existing: bool = False,
     city_limit: int | None = None,
 ):
@@ -450,7 +450,7 @@ def main():
         "--manifest", type=str, default=None, help="Manifest path (default: <output>/manifest.json)"
     )
     parser.add_argument("--image-size", type=int, default=600)
-    parser.add_argument("--dpi", type=int, default=100)
+    parser.add_argument("--dpi", type=int, default=300)
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--city-limit", type=int, default=None)
     parser.add_argument("--skip-existing", action="store_true")

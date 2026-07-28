@@ -36,6 +36,7 @@ import numpy as np
 from tqdm import tqdm
 
 from eval.metrics import (
+    append_csv_row,
     classify_scale,
     compute_all_geometric_metrics,
     compute_route_coverage,
@@ -43,7 +44,9 @@ from eval.metrics import (
     extract_intersection_graph,
     get_resource_stats,
     is_metadrive_road_node,
+    load_csv_keys,
     load_osm_reference_degree,
+    monitor_resources,
     print_results_table,
     save_results,
     save_system_info,
@@ -116,10 +119,9 @@ def generate_metadrive_map(seed: int, map_config: int = 7, graph_method: str = "
 
     # Graph extraction
     if graph_method == "skeleton":
-        # Merge distance in meters: enough to combine skeleton junction
-        # pixels at the same intersection (typically 3-8 px at 1024 res)
-        # without merging separate intersections (typically >30m apart).
-        merge_m = 8.0
+        # Merge distance in pixels at 1024×1024 resolution.
+        # Tuned: merge_d=15 gives mc=15→~10 nodes, mc=25→~58 nodes.
+        merge_m = 15.0
         G = polylines_to_graph(polylines, resolution=1024, cleanup=False, merge_distance=merge_m)
     else:
         G = _extract_graph_legacy(env)
@@ -490,51 +492,146 @@ def main():
     gm = args.graph_method
     run_all = args.all or not (args.topology or args.route or args.geometry or args.scalability)
 
+    # In --all mode, always save visualizations + use skeleton extraction
+    if run_all and vis_dir is None:
+        vis_dir = output_dir / "vis"
+    if run_all:
+        gm = "skeleton"
+
     init_stats = get_resource_stats()
     peak_stats = dict(init_stats)
 
     if run_all:
-        # Multi-config sweep: ensure each 5-node bin (5-60) gets ≥5 maps
+        output_dir.mkdir(parents=True, exist_ok=True)
+        # ── Multi-config sweep: ensure each 5-node bin (10-80) gets ≥5 maps ──
         ref_deg = load_osm_reference_degree()
-        from eval.metrics import compute_all_geometric_metrics
 
-        target_bins = list(range(5, 61, 5))  # [5,10,15,...,60]
+        target_bins = list(range(10, 81, 5))  # [10,15,...,80]
         bin_counts = {b: 0 for b in target_bins}
 
         def _bin(n):
             return ((n - 1) // 5) * 5 + 5  # round up to nearest 5
 
+        # Skeleton extraction + merge_d=15: mc=7→~5-10, mc=15→~10-20,
+        # mc=25→~40-60, mc=40→~80+ nodes.  Covers 10-80 node range.
         params = [
-            (3, "small"),
-            (7, "medium"),
-            (10, "medium"),
-            (15, "large"),
-            (20, "large"),
+            (7, "small"),
+            (10, "small"),
+            (15, "medium"),
+            (20, "medium"),
             (25, "large"),
+            (30, "large"),
+            (35, "large"),
+            (40, "large"),
+            (45, "large"),
+            (50, "large"),
         ]
+
+        # ── Resume: load existing CSV ─────────────────────────────────────
+        csv_path = output_dir / "all_metrics.csv"
+        seen_keys = load_csv_keys(csv_path, ["map_config", "seed"])
+        if seen_keys:
+            print(f"  Resuming: {len(seen_keys)} existing maps loaded from {csv_path.name}")
+
+        # Count existing rows to continue map_id
+        existing_count = 0
+        if csv_path.exists():
+            with open(csv_path) as _f:
+                existing_count = max(0, sum(1 for _ in _f) - 1)
+
         per_map = []
         t0 = time.time()
 
         for mc, _label in params:
+            consecutive_stall = 0
             for seed in range(200):
+                key = f"{mc}|{seed}"
+                if key in seen_keys:
+                    continue  # already done
+
                 # Stop when all target bins have ≥5
                 if all(c >= 5 for c in bin_counts.values()):
                     break
                 try:
-                    r = generate_metadrive_map(seed, map_config=mc, graph_method=gm)
-                    G = r["graph"]
+                    with monitor_resources(interval=0.3) as peaks:
+                        r = generate_metadrive_map(seed, map_config=mc, graph_method=gm)
+                        G = r["graph"]
+                    if G.number_of_nodes() < 2:
+                        continue
                 except Exception:
-                    continue
-                if G.number_of_nodes() < 2:
-                    continue
+                    # Invalid map_config → skip to next config
+                    consecutive_stall = 999
+                    break
+
                 nb = _bin(G.number_of_nodes())
+                if nb < target_bins[0]:  # skip small maps (bin 5)
+                    consecutive_stall += 1
+                    continue
                 if nb in bin_counts and bin_counts[nb] >= 5:
-                    continue  # this bin already full
-                resource = get_resource_stats()
+                    consecutive_stall += 1  # bin already full, no progress
+                    if consecutive_stall >= 30:
+                        print(
+                            f"    map_config={mc}: stall ({consecutive_stall} seeds "
+                            f"no progress), skipping"
+                        )
+                        break
+                    continue
+
+                # ── This map contributes to a bin → reset stall ──
+                consecutive_stall = 0
+
                 topo = compute_topological_metrics(G, ref_avg_degree=ref_deg)
                 route = compute_route_coverage(G, n_pairs=100, seed=seed)
                 geo = compute_all_geometric_metrics(r["polylines"], G=G)
                 scale = classify_scale(topo["node_count"])
+
+                row = {
+                    "map_id": existing_count + len(per_map),
+                    "seed": seed,
+                    "map_config": mc,
+                    "scale": scale,
+                    "n_nodes": topo["node_count"],
+                    "n_edges": topo["edge_count"],
+                    **{
+                        k: topo[k]
+                        for k in ("lcc", "dead_end_ratio", "avg_degree", "delta_avg_degree")
+                    },
+                    **{k: route[k] for k in ("reachable_ratio", "avg_route_length")},
+                    **{
+                        k: geo.get(k, "")
+                        for k in (
+                            "chamfer_loo",
+                            "chamfer_loo_std",
+                            "endpoint_alignment",
+                            "mean_turning_angle_deg",
+                            "intersection_rate",
+                            "mean_edge_length",
+                            "cv_edge_length",
+                            "total_road_length",
+                            "mean_spacing_cv",
+                            "mean_angle_deg",
+                        )
+                    },
+                    "gen_time_s": round(r["generation_time"], 4),
+                    "cpu_peak": round(peaks["cpu_peak"], 1),
+                    "mem_peak_mb": round(peaks["mem_peak_mb"], 1),
+                    "gpu_peak_mb": round(peaks["gpu_peak_mb"], 1),
+                }
+                per_map.append(row)
+                append_csv_row(csv_path, list(row.keys()), row)
+                seen_keys.add(key)
+
+                if nb in bin_counts:
+                    bin_counts[nb] += 1
+
+                if len(per_map) % 10 == 0:
+                    filled = sum(1 for c in bin_counts.values() if c >= 5)
+                    print(
+                        f"  [{existing_count + len(per_map)} maps] "
+                        f"bins filled: {filled}/{len(target_bins)}"
+                    )
+
+                # ── Vis (up to 5 per scale) ──
                 if vis_dir is not None:
                     cnt = len(list(Path(vis_dir).glob(f"md_{scale}_*.png")))
                     if cnt < 5:
@@ -546,69 +643,21 @@ def main():
                                 / f"md_{scale}_N{G.number_of_nodes()}E{G.number_of_edges()}_{cnt}.png"
                             ),
                         )
-                per_map.append(
-                    {
-                        "map_id": len(per_map),
-                        "seed": seed,
-                        "scale": scale,
-                        "gen_time_s": round(r["generation_time"], 4),
-                        **resource,
-                        **topo,
-                        **route,
-                        **geo,
-                    }
-                )
-                if nb in bin_counts:
-                    bin_counts[nb] += 1
-                if len(per_map) % 10 == 0:
-                    filled = sum(1 for c in bin_counts.values() if c >= 5)
-                    print(f"  [{len(per_map)} maps] bins filled: {filled}/{len(target_bins)}")
+
             if all(c >= 5 for c in bin_counts.values()):
                 break
 
         gen_time = time.time() - t0
+        n_total = existing_count + len(per_map)
         print(f"  Bin counts: {dict(bin_counts)}")
-        # Save combined CSV
-        import csv
-
-        cols = [
-            "map_id",
-            "scale",
-            "n_nodes",
-            "n_edges",
-            "lcc",
-            "dead_end_ratio",
-            "avg_degree",
-            "delta_avg_degree",
-            "reachable_ratio",
-            "avg_route_length",
-            "chamfer_loo",
-            "chamfer_loo_std",
-            "endpoint_alignment",
-            "mean_turning_angle_deg",
-            "intersection_rate",
-            "mean_edge_length",
-            "cv_edge_length",
-            "total_road_length",
-            "mean_spacing_cv",
-            "mean_angle_deg",
-            "gen_time_s",
-            "cpu_percent",
-            "mem_mb",
-            "gpu_mem_mb",
-        ]
-        key_map = {"n_nodes": "node_count", "n_edges": "edge_count"}
-        with open(output_dir / "all_metrics.csv", "w", newline="") as f:
-            w = csv.writer(f)
-            w.writerow(cols)
-            for m in per_map:
-                w.writerow([m.get(key_map.get(c, c), "") for c in cols])
-        print(f"  Saved {len(per_map)} maps to {output_dir / 'all_metrics.csv'}")
-        print(f"  Generation: {gen_time:.1f}s total, {gen_time/max(len(per_map),1):.1f}s/map")
+        print(
+            f"  Generated {len(per_map)} new maps (→{n_total} total) in "
+            f"{gen_time:.1f}s, {gen_time/max(len(per_map),1):.1f}s/map"
+        )
         final_stats = get_resource_stats()
         for k in peak_stats:
             peak_stats[k] = max(peak_stats[k], final_stats[k])
-        save_system_info(output_dir, "MetaDrive", init_stats, peak_stats, len(per_map))
+        save_system_info(output_dir, "MetaDrive", init_stats, peak_stats, n_total)
     else:
         if args.topology:
             run_topology_eval(

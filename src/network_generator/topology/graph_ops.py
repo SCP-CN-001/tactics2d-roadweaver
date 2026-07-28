@@ -643,6 +643,7 @@ def detect_roundabouts(
     map_size_m: float = 5000.0,
     max_cycle_size: int = 80,
     skip_area_check: bool = False,
+    skip_deg2_check: bool = False,
 ) -> np.ndarray:
     """Detect roundabout cycles and return updated node_types with NT_ROUNDABOUT set.
 
@@ -690,9 +691,10 @@ def detect_roundabouts(
         if any(d > 3 for d in ring_degs):
             continue
 
-        # At least 40% should be deg-2 (ring nodes)
+        # At least 40% should be deg-2 (ring nodes), unless skip_deg2_check
+        # (compressed intersection graphs have no degree-2 nodes)
         deg2_count = sum(1 for d in ring_degs if d == 2)
-        if deg2_count < len(cycle) * 0.4:
+        if not skip_deg2_check and deg2_count < len(cycle) * 0.4:
             continue
 
         # At least one node must have deg >= 3 (connection to external road network)
@@ -720,7 +722,7 @@ def detect_roundabouts(
         if mean_d < 5.0 / map_size_m:
             continue
         cv = float(dists.std()) / max(mean_d, 1e-8)
-        if cv >= 0.5:
+        if cv >= 0.45:
             continue
 
         # Area check: shoelace formula on ordered polygon
@@ -728,10 +730,121 @@ def detect_roundabouts(
             xs, ys = pts[:, 0], pts[:, 1]
             area = 0.5 * abs(float(np.dot(xs, np.roll(ys, 1)) - np.dot(ys, np.roll(xs, 1))))
             area_m2 = area * map_size_m * map_size_m
-            if area_m2 < 300 or area_m2 > 30000:
+            if area_m2 < 300 or area_m2 > 5000:
                 continue
 
         for n in cycle:
             types[n] = NT_ROUNDABOUT
 
     return types
+
+
+# ── Graph compression ────────────────────────────────────────────────
+
+
+def compress_to_intersection_graph(coords, edge_index):
+    """Contract all degree-2 nodes → only intersections / endpoints remain.
+
+    Returns ``(int_coords, int_edge_index, geometries)``.
+    """
+    if len(coords) < 5:
+        return coords, edge_index, []
+    import networkx as nx
+
+    G = nx.Graph()
+    for i, p in enumerate(coords):
+        G.add_node(i, pos=p)
+    for u, v in edge_index:
+        G.add_edge(int(u), int(v))
+
+    # --- Contract degree-2 nodes (no geometry tracking) ---
+    changed = True
+    while changed:
+        changed = False
+        for n in list(G.nodes()):
+            if G.degree(n) != 2:
+                continue
+            nbs = list(G.neighbors(n))
+            if len(nbs) != 2:
+                continue
+            u, v = nbs
+            G.add_edge(u, v)
+            G.remove_node(n)
+            changed = True
+            break
+
+    # --- Build geometry AFTER contraction: BFS on original adjacency ---
+    orig_adj = {i: set() for i in range(len(coords))}
+    for a, b in edge_index:
+        ia, ib = int(a), int(b)
+        orig_adj[ia].add(ib)
+        orig_adj[ib].add(ia)
+
+    from collections import deque
+
+    def _trace(start, end):
+        parent = {start: None}
+        q = deque([start])
+        while q:
+            cur = q.popleft()
+            if cur == end:
+                break
+            for nb in orig_adj[cur]:
+                if nb not in parent:
+                    parent[nb] = cur
+                    q.append(nb)
+        path = []
+        cur = end
+        while cur is not None:
+            path.append(coords[cur])
+            cur = parent.get(cur)
+        return path[::-1]  # start \u2192 end
+
+    nodes = sorted(G.nodes())
+    idx = {n: i for i, n in enumerate(nodes)}
+    c2 = np.array([G.nodes[n]["pos"] for n in nodes])
+    e2, geoms = [], []
+    for u, v in G.edges():
+        e2.append([idx[u], idx[v]])
+        geoms.append(np.array(_trace(u, v)))
+    return c2, np.array(e2, dtype=np.int64), geoms
+
+
+def classify_nodes(coords, edge_index, map_m, merge_dist_m=50.0, compressed=False):
+    """Classify nodes (0=waypoint, 1=junction, 3=roundabout, 4=endpoint).
+
+    When ``compressed=True`` the degree-2 check for roundabout detection
+    is skipped (for intersection-level graphs).
+    """
+    import networkx as nx
+
+    G = nx.Graph()
+    for i in range(len(coords)):
+        G.add_node(i, pos=coords[i].copy())
+    G.add_edges_from(edge_index)
+
+    nt = np.zeros(len(coords), dtype=np.int64)
+    for n in range(len(coords)):
+        d = G.degree(n)
+        if d >= 3:
+            nt[n] = NT_JUNCTION
+        elif d <= 1:
+            nt[n] = NT_ENDPOINT
+        else:
+            nt[n] = NT_WAYPOINT
+
+    nt = detect_roundabouts(
+        coords, edge_index, nt, map_size_m=map_m, max_cycle_size=12, skip_deg2_check=compressed
+    )
+
+    merged = set()
+    for i in range(len(coords)):
+        if i in merged or nt[i] != NT_JUNCTION:
+            continue
+        for j in range(i + 1, len(coords)):
+            if j in merged or nt[j] != NT_JUNCTION:
+                continue
+            if np.linalg.norm(coords[i] - coords[j]) < merge_dist_m / map_m:
+                merged.add(j)
+                nt[j] = NT_WAYPOINT
+    return nt

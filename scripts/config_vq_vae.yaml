@@ -5,6 +5,13 @@ num_codes: 512
 embed_dim: 64
 commitment_cost: 0.25
 decay: 0.99
+
+# Phase A: Code Spread Loss (set margin>0 and weight>0 to enable)
+# Promotes uniform code distribution in embedding space,
+# reducing synonymous codes. Suggested start: margin=0.4, weight=0.05
+# spread_margin: 0.4
+# spread_weight: 0.05
+
 epochs: 30
 batch_size: 1024
 lr: 0.001

@@ -40,6 +40,10 @@ class VectorQuantizer(nn.Module):
     Uses Euclidean distance for code lookup and EMA for codebook learning,
     which is more stable than gradient-based optimisation and prevents
     codebook collapse (dead codes are periodically reset).
+
+    Supports optional ``code_spread_loss`` that penalises pairwise cosine
+    similarity in the codebook, encouraging vectors to be uniformly
+    distributed on the hypersphere and reducing synonymous codes.
     """
 
     def __init__(
@@ -48,12 +52,16 @@ class VectorQuantizer(nn.Module):
         embedding_dim: int = 64,
         commitment_cost: float = 0.25,
         decay: float = 0.99,
+        spread_margin: float = 0.0,
+        spread_weight: float = 0.0,
     ):
         super().__init__()
         self.num_embeddings = num_embeddings
         self.embedding_dim = embedding_dim
         self.commitment_cost = commitment_cost
         self.decay = decay
+        self.spread_margin = spread_margin
+        self.spread_weight = spread_weight
 
         self.embedding = nn.Embedding(num_embeddings, embedding_dim)
         self.embedding.weight.data.uniform_(-1.0 / num_embeddings, 1.0 / num_embeddings)
@@ -115,6 +123,20 @@ class VectorQuantizer(nn.Module):
         # Commitment loss
         commitment_loss = F.mse_loss(z_e_flat, z_q_flat.detach())
 
+        # ── Code spread loss: keep encoder outputs diverse ──────────────
+        # Computed on z_e (not codebook weights) so gradients flow through
+        # the straight-through estimator into the encoder.  Through EMA the
+        # diverse encoder outputs naturally spread the codebook entries.
+        if self.training and self.spread_weight > 0 and self.spread_margin > 0:
+            sub = z_e_flat[torch.randperm(z_e_flat.shape[0])[: min(4096, z_e_flat.shape[0])]]
+            normed = F.normalize(sub, dim=-1)
+            sim = normed @ normed.T
+            n = sub.shape[0]
+            tri = ~torch.eye(n, dtype=bool, device=sim.device)
+            code_spread = F.relu(sim[tri] - self.spread_margin).mean()
+        else:
+            code_spread = torch.tensor(0.0, device=z_e.device)
+
         # Metrics
         with torch.no_grad():
             counts = torch.bincount(indices_flat, minlength=self.num_embeddings).float()
@@ -129,6 +151,8 @@ class VectorQuantizer(nn.Module):
                 "vq_loss": self.commitment_cost * commitment_loss,
                 "codebook_loss": 0.0,
                 "commitment_loss": commitment_loss.item(),
+                "code_spread_loss": code_spread.item(),
+                "code_spread_weighted": self.spread_weight * code_spread,
                 "perplexity": perplexity,
                 "usage": usage,
                 "dead_codes": len(dead_codes) if self.training else 0,
@@ -173,6 +197,8 @@ class VQVAE(nn.Module):
         code_map_size: int | None = None,
         commitment_cost: float = 0.25,
         decay: float = 0.99,
+        spread_margin: float = 0.0,
+        spread_weight: float = 0.0,
     ):
         """
         Args:
@@ -184,6 +210,8 @@ class VQVAE(nn.Module):
                 Must be a power-of-two divisor of ``resolution``.
             commitment_cost: VQ commitment loss weight.
             decay: EMA decay for codebook update.
+            spread_margin: margin for code spread loss (0 = disabled).
+            spread_weight: weight for code spread loss (0 = disabled).
         """
         super().__init__()
 
@@ -235,6 +263,8 @@ class VQVAE(nn.Module):
             embedding_dim=embed_dim,
             commitment_cost=commitment_cost,
             decay=decay,
+            spread_margin=spread_margin,
+            spread_weight=spread_weight,
         )
 
     @staticmethod

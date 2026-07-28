@@ -403,6 +403,6 @@ def save_vis(
 
     plt.tight_layout()
     Path(filepath).parent.mkdir(parents=True, exist_ok=True)
-    plt.savefig(filepath, dpi=150, bbox_inches="tight")
+    plt.savefig(filepath, dpi=300, bbox_inches="tight")
     plt.close()
     print(f"  [vis] Saved {filepath}")
