@@ -255,6 +255,12 @@ def main():
                 c7, e7, geoms, map_max, angle_deg=20.0, max_dist_m=30.0
             )
 
+            # ── Re-fix crossings created by structural ops ───────────
+            # merge_nearby_junctions / split_high_degree_junctions move edge
+            # endpoints and can introduce new geometric crossings; fix them
+            # after all structural changes (matches pipeline.py generate_branch).
+            c7, e7, geoms = fix_edge_crossings(c7, e7, geoms, map_max)
+
             # ── Re-align geometry endpoints to node positions ────────
             geoms = align_geometries_to_nodes(c7, e7, geoms)
 

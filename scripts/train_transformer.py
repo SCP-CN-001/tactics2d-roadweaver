@@ -6,7 +6,7 @@ Frozen VQ-VAE encodes road fields into discrete code maps,
 a masked Transformer learns to predict masked tokens given condition.
 
 Usage:
-    python scripts/train_transformer.py                             # uses config_transformer.yaml
+    python scripts/train_transformer.py                             # uses config_transformer_style.yaml
     python scripts/train_transformer.py --config my_config.yaml      # custom config
 """
 
@@ -31,7 +31,7 @@ from network_generator.backbone.dataset import make_field_dataloader
 from network_generator.backbone.transformer import MaskedCodeModel
 from network_generator.backbone.vq_vae import VQVAE
 
-DEFAULT_CONFIG = "scripts/config_transformer.yaml"
+DEFAULT_CONFIG = "scripts/config_transformer_style.yaml"
 
 
 class CachedCodeMapDataset(Dataset):

@@ -186,11 +186,6 @@ def graph_to_map(
     # ---- Build road lanes --------------------------------------------
     for e in range(n_edges):
         u, v = int(ei[e, 0]), int(ei[e, 1])
-        # Skip edges attached to a dead-end node
-        if (u < len(node_types) and int(node_types[u]) == 4) or (
-            v < len(node_types) and int(node_types[v]) == 4
-        ):
-            continue
         n_lanes = max(1, int(lanes_per_dir[e]))
         speed = _SPEED_BY_RC.get(int(road_class[e]) if e < len(road_class) else 2, 50)
         pts = geoms_road[e]
@@ -305,6 +300,7 @@ def graph_to_map(
         centre = np.mean([c[n] for n in group], axis=0)
         arms: list[dict] = []
         _ra_arm_edges: list[int] = []  # edge_id per arm, same order as arms
+        _ra_arm_incoming: list[bool] = []  # spoke edge is incoming to its RA node?
         for n in group:
             for e in node_in[n] + node_out[n]:
                 u, v = int(ei[e, 0]), int(ei[e, 1])
@@ -318,8 +314,9 @@ def graph_to_map(
                     ep = pts[-1]  # geometry endpoint near roundabout
                 else:
                     ep = pts[0]
-                dir_to_centre = centre - ep
-                h = float(np.arctan2(dir_to_centre[1], dir_to_centre[0]))
+                # Outward heading: from group centre toward the spoke connection.
+                # (The roundabout module places sockets at centre + R * heading_outward.)
+                h = float(np.arctan2(ep[1] - centre[1], ep[0] - centre[0]))
                 arms.append(
                     {
                         "heading": h,
@@ -331,6 +328,7 @@ def graph_to_map(
                     }
                 )
                 _ra_arm_edges.append(e)
+                _ra_arm_incoming.append(e in node_in[n])
         if len(arms) >= 2:
             ra = Roundabout(
                 ring_radius=_INTERSECTION_RADIUS * 3,
@@ -380,16 +378,21 @@ def graph_to_map(
                 port_lanes.sort(key=lambda x: x[1])
 
                 candidates = []
-                _start = 0 if is_in else n_lanes
-                _end = n_lanes if is_in else 2 * n_lanes
+                # Lanes approaching n are forward if the edge ends at n, backward if it
+                # starts at n; the departing set is the other. Junction-side coords index:
+                # approach -> coords[-1], depart -> coords[0] (both fwd & bwd).
+                edge_is_incoming = _ra_arm_incoming[arm_idx]
+                use_forward = (is_in and edge_is_incoming) or (not is_in and not edge_is_incoming)
+                if use_forward:
+                    _start, _end, _eidx = 0, n_lanes, (-1 if is_in else 0)
+                else:
+                    _start, _end, _eidx = n_lanes, 2 * n_lanes, (-1 if is_in else 0)
                 for __idx in range(_start, _end):
                     lid = f"e{edge_id}_l{__idx}"
                     if lid not in all_lanes:
                         continue
                     try:
                         lane = all_lanes[lid]
-                        _is_fwd = __idx < n_lanes
-                        _eidx = -1 if _is_fwd else 0
                         le = np.array(list(lane.left_side.coords)[_eidx])
                         re = np.array(list(lane.right_side.coords)[_eidx])
                         ep = (le + re) / 2
@@ -399,25 +402,55 @@ def graph_to_map(
                         continue
                 candidates.sort(key=lambda x: x[1])
 
-                n_match = min(len(candidates), len(port_lanes))
-                for k in range(n_match):
-                    lid, _ = candidates[k]
-                    rid, _lat, _lt, _rt = port_lanes[k]
-                    (_link if is_in else lambda a, b: _link(b, a))(lid, rid)
-                    try:
-                        lane = all_lanes[lid]
-                        _left = np.array(list(lane.left_side.coords))
-                        _right = np.array(list(lane.right_side.coords))
-                        if is_in:
-                            _left[-1] = _lt.copy()
-                            _right[-1] = _rt.copy()
-                        else:
-                            _left[0] = _lt.copy()
-                            _right[0] = _rt.copy()
-                        lane.left_side = LineString(_left)
-                        lane.right_side = LineString(_right)
-                    except Exception:
-                        pass
+                if is_in:
+                    # Approach: every approaching road lane gets a connector as
+                    # successor (a connector may accept several road lanes), so
+                    # no road lane is left dangling and successor chains do not
+                    # break at the roundabout.
+                    n_conn = len(port_lanes)
+                    if n_conn and candidates:
+                        for k in range(len(candidates)):
+                            lid, _ = candidates[k]
+                            rid, _lat, _lt, _rt = port_lanes[k % n_conn]
+                            _link(lid, rid)
+                        for k in range(min(len(candidates), n_conn)):
+                            lid, _ = candidates[k]
+                            _lt, _rt = port_lanes[k][2], port_lanes[k][3]
+                            try:
+                                lane = all_lanes[lid]
+                                _left = np.array(list(lane.left_side.coords))
+                                _right = np.array(list(lane.right_side.coords))
+                                _left[-1] = _lt.copy()
+                                _right[-1] = _rt.copy()
+                                lane.left_side = LineString(_left)
+                                lane.right_side = LineString(_right)
+                            except Exception:
+                                pass
+                else:
+                    # Depart: every connector ending at this arm gets the depart
+                    # road as its successor (a road lane accepts traffic from
+                    # several connectors), so no connector is left dangling.
+                    n_depart = len(candidates)
+                    if n_depart and port_lanes:
+                        for k in range(len(port_lanes)):
+                            rid, _lat, _lt, _rt = port_lanes[k]
+                            lid, _ = candidates[k % n_depart]
+                            _link(rid, lid)
+                        # Snap each depart lane's start once, from the laterally
+                        # best-matching connectors.
+                        for k in range(min(n_depart, len(port_lanes))):
+                            lid, _ = candidates[k]
+                            _lt, _rt = port_lanes[k][2], port_lanes[k][3]
+                            try:
+                                lane = all_lanes[lid]
+                                _left = np.array(list(lane.left_side.coords))
+                                _right = np.array(list(lane.right_side.coords))
+                                _left[0] = _lt.copy()
+                                _right[0] = _rt.copy()
+                                lane.left_side = LineString(_left)
+                                lane.right_side = LineString(_right)
+                            except Exception:
+                                pass
 
     # ---- Individual intersection nodes (non-RA) -----------------------
     for n in range(len(c)):
@@ -493,19 +526,23 @@ def graph_to_map(
 
                     # Collect road lane boundary positions (only from this edge, right direction)
                     candidates = []
-                    _start = (
-                        0 if is_in else n_lanes
-                    )  # forward=0..n_lanes-1, backward=n_lanes..2*n_lanes-1
-                    _end = n_lanes if is_in else 2 * n_lanes
+                    # Lanes approaching n are forward if the edge ends at n, backward if it
+                    # starts at n; the departing set is the other. Junction-side coords index:
+                    # approach -> coords[-1], depart -> coords[0] (both fwd & bwd).
+                    edge_is_incoming = edge_id in node_in[n]
+                    use_forward = (is_in and edge_is_incoming) or (
+                        not is_in and not edge_is_incoming
+                    )
+                    if use_forward:
+                        _start, _end, _eidx = 0, n_lanes, (-1 if is_in else 0)
+                    else:
+                        _start, _end, _eidx = n_lanes, 2 * n_lanes, (-1 if is_in else 0)
                     for _idx in range(_start, _end):
                         lid = f"e{edge_id}_l{_idx}"
                         if lid not in all_lanes:
                             continue
                         try:
                             lane = all_lanes[lid]
-                            _is_fwd = _idx < n_lanes
-                            # forward: coords[-1] at junction v; backward: coords[0] at junction v (reversed)
-                            _eidx = -1 if _is_fwd else 0
                             le = np.array(list(lane.left_side.coords)[_eidx])
                             re = np.array(list(lane.right_side.coords)[_eidx])
                             ep = (le + re) / 2
@@ -515,49 +552,112 @@ def graph_to_map(
                             continue
                     candidates.sort(key=lambda x: x[1])
 
-                    # 1:1 match by lateral order
-                    n_match = min(len(candidates), len(port_lanes))
-                    for k in range(n_match):
-                        lid, _ = candidates[k]
-                        iid, _lat, _lt, _rt = port_lanes[k]
-                        (_link if is_in else lambda a, b: _link(b, a))(lid, iid)
-
-                        # Snap road lane boundary to port lane boundary
-                        try:
-                            lane = all_lanes[lid]
-                            _left = np.array(list(lane.left_side.coords))
-                            _right = np.array(list(lane.right_side.coords))
-                            if is_in:
-                                _left[-1] = _lt.copy()
-                                _right[-1] = _rt.copy()
-                            else:
-                                _left[0] = _lt.copy()
-                                _right[0] = _rt.copy()
-                            lane.left_side = LineString(_left)
-                            lane.right_side = LineString(_right)
-                        except Exception:
-                            pass
+                    if is_in:
+                        # Approach: every approaching road lane gets a connector as
+                        # successor (a connector may accept several road lanes), so
+                        # no road lane is left dangling and successor chains do not
+                        # break at the junction.
+                        n_conn = len(port_lanes)
+                        if n_conn and candidates:
+                            for k in range(len(candidates)):
+                                lid, _ = candidates[k]
+                                iid, _lat, _lt, _rt = port_lanes[k % n_conn]
+                                _link(lid, iid)
+                            # Snap road lane junction ends from the laterally
+                            # best-matching connectors.
+                            for k in range(min(len(candidates), n_conn)):
+                                lid, _ = candidates[k]
+                                _lt, _rt = port_lanes[k][2], port_lanes[k][3]
+                                try:
+                                    lane = all_lanes[lid]
+                                    _left = np.array(list(lane.left_side.coords))
+                                    _right = np.array(list(lane.right_side.coords))
+                                    _left[-1] = _lt.copy()
+                                    _right[-1] = _rt.copy()
+                                    lane.left_side = LineString(_left)
+                                    lane.right_side = LineString(_right)
+                                except Exception:
+                                    pass
+                    else:
+                        # Depart: every connector ending at this arm gets the depart
+                        # road as its successor (a road lane accepts traffic from
+                        # several connectors), so no connector is left dangling.
+                        n_depart = len(candidates)
+                        if n_depart and port_lanes:
+                            for k in range(len(port_lanes)):
+                                iid, _lat, _lt, _rt = port_lanes[k]
+                                lid, _ = candidates[k % n_depart]
+                                _link(iid, lid)
+                            # Snap each depart lane's start once, from the laterally
+                            # best-matching connectors.
+                            for k in range(min(n_depart, len(port_lanes))):
+                                lid, _ = candidates[k]
+                                _lt, _rt = port_lanes[k][2], port_lanes[k][3]
+                                try:
+                                    lane = all_lanes[lid]
+                                    _left = np.array(list(lane.left_side.coords))
+                                    _right = np.array(list(lane.right_side.coords))
+                                    _left[0] = _lt.copy()
+                                    _right[0] = _rt.copy()
+                                    lane.left_side = LineString(_left)
+                                    lane.right_side = LineString(_right)
+                                except Exception:
+                                    pass
             except Exception as exc:
                 print(f"  [Map] Intersection at node {n} failed: {exc}")
 
     # ---- Direct road -> road successor (non-junction nodes) ------------
+    # A degree-2 waypoint is a bend: the approaching lanes of one incident
+    # edge continue into the departing lanes of the other, regardless of the
+    # graph edge direction (which may be arbitrary after compression).
     for n in range(len(c)):
         if int(node_types[n]) in (1, 3):
             continue
-    for n in range(len(c)):
-        if int(node_types[n]) in (1, 3):
+        incident = list(node_in[n]) + list(node_out[n])
+        if len(incident) != 2:
             continue
-        for ie in node_in[n]:
-            ni = int(lanes_per_dir[ie])
-            for oe in node_out[n]:
-                if ie == oe:
-                    continue
-                no = int(lanes_per_dir[oe])
-                for k in range(max(ni, no)):
-                    mk = min(k, no - 1)
-                    ik = min(k, ni - 1)
-                    _link(f"e{ie}_l{ik}", f"e{oe}_l{mk}")
-                    _link(f"e{oe}_l{mk + no}", f"e{ie}_l{ik + ni}")
+        e1, e2 = incident
+        if e1 == e2:
+            continue
+        for ea, eb in ((e1, e2), (e2, e1)):
+            na = int(lanes_per_dir[ea])
+            nb = int(lanes_per_dir[eb])
+            ea_approach_fwd = ea in node_in[n]  # forward lanes approach n
+            eb_depart_fwd = eb not in node_in[n]  # forward lanes depart n
+            for k in range(max(na, nb)):
+                ia = min(k, na - 1)
+                ib = min(k, nb - 1)
+                lid_a = f"e{ea}_l{ia if ea_approach_fwd else ia + na}"
+                lid_b = f"e{eb}_l{ib if eb_depart_fwd else ib + nb}"
+                _link(lid_a, lid_b)
+
+    # ---- Remove road lanes disconnected from the junction network ----
+    # A road lane is kept only if it is reachable (via successor links) from
+    # some intersection/roundabout connector.  Fully-isolated road segments
+    # (edges with no junction on either end, redundant roundabout ring edges)
+    # are dropped so the HD map has no floating roads.
+    conn_ids = {lid for lid in all_lanes if lid.startswith("int") or lid.startswith("ra")}
+    if conn_ids:
+        _adj: dict[str, set[str]] = {}
+        for _lid, _lane in all_lanes.items():
+            for _s in _lane.successors:
+                _adj.setdefault(_lid, set()).add(_s)
+                _adj.setdefault(_s, set()).add(_lid)
+        reached: set[str] = set()
+        stack = list(conn_ids)
+        while stack:
+            cur = stack.pop()
+            if cur in reached:
+                continue
+            reached.add(cur)
+            for nb in _adj.get(cur, ()):
+                if nb not in reached:
+                    stack.append(nb)
+        isolated = {lid for lid in all_lanes if lid.startswith("e") and lid not in reached}
+        for lid in isolated:
+            del all_lanes[lid]
+        if isolated:
+            print(f"  [Map] removed {len(isolated)} isolated road lanes")
 
     # ---- Assemble Map ------------------------------------------------
     hd_map = Map(name=name, scenario_type=scenario_type)

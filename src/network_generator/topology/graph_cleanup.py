@@ -5,7 +5,6 @@ from __future__ import annotations
 import networkx as nx
 import numpy as np
 from shapely.geometry import LineString, Point
-from shapely.ops import split as shapely_split
 from shapely.strtree import STRtree
 
 from utils.geometry import segment_intersection as _segment_intersection
@@ -266,31 +265,63 @@ def fix_edge_crossings(coords, edge_index, geometries, map_size_m):
             out_ei.append((u, v))
             out_geoms.append(geoms[idx])
             continue
-        pts = sorted(splits[idx], key=lambda p: lines[idx].project(Point(p)))
-        cut_points = [Point(p) for p in pts]
-        parts = shapely_split(
-            lines[idx],
-            (
-                cut_points[0]
-                if len(cut_points) == 1
-                else __import__("shapely.geometry", fromlist=["MultiPoint"]).MultiPoint(cut_points)
-            ),
-        )
-        parts = list(parts.geoms) if hasattr(parts, "geoms") else [parts]
+        g = geoms[idx]
+        if len(g) < 2:
+            g = np.array([c[u], c[v]])
+        # Cumulative arc length along the polyline.
+        seg_len = np.sqrt(((g[1:] - g[:-1]) ** 2).sum(axis=1))
+        cum = np.concatenate([[0], np.cumsum(seg_len)])
+        total = float(cum[-1])
+        if total < 1e-12:
+            out_ei.append((u, v))
+            out_geoms.append(g)
+            continue
 
-        # Assign endpoints: part 0 starts at u; part -1 ends at v; interior
-        # boundaries are the cut nodes (in order).
+        # Sort crossing points by arc-length position, drop near-duplicates.
+        cuts = sorted(
+            (lines[idx].project(Point(p)) / total, np.asarray(p, dtype=float)) for p in splits[idx]
+        )
+        deduped: list[tuple[float, np.ndarray]] = []
+        for f, p in cuts:
+            if not deduped or f - deduped[-1][0] > 1e-4:
+                deduped.append((f, p))
+
+        # Cut the polyline at each crossing point by interpolating segments.
         prev_node = u
-        prev_end = None  # coordinates of the last cut point on this edge
-        for p_idx, part in enumerate(parts):
-            if p_idx < len(parts) - 1:
-                nid = _node(tuple(np.round(part.coords[-1], 6)))
-                out_ei.append((prev_node, nid))
-                out_geoms.append(np.array(part.coords))
-                prev_node = nid
-            else:
-                out_ei.append((prev_node, v))
-                out_geoms.append(np.array(part.coords))
+        prev_pt = np.asarray(c[u], dtype=float)
+        prev_cum = 0.0
+        for f, p in deduped:
+            target_cum = f * total
+            sub_pts = [prev_pt.copy()]
+            for k in range(1, len(g)):
+                if cum[k] <= prev_cum + 1e-12:
+                    continue
+                if cum[k - 1] >= target_cum - 1e-12:
+                    break
+                seg_start = max(prev_cum, cum[k - 1])
+                seg_end = min(target_cum, cum[k])
+                if seg_end <= seg_start:
+                    continue
+                t = (seg_start - cum[k - 1]) / (cum[k] - cum[k - 1] + 1e-12)
+                sub_pts.append(g[k - 1] + t * (g[k] - g[k - 1]))
+            sub_pts.append(p)  # endpoint = the (rounded) crossing point
+            nid = _node(tuple(np.round(p, 6)))
+            out_ei.append((prev_node, nid))
+            out_geoms.append(np.array(sub_pts))
+            prev_node = nid
+            prev_pt = p
+            prev_cum = target_cum
+
+        # Final segment to v.
+        sub_pts = [prev_pt.copy()]
+        for k in range(1, len(g)):
+            if cum[k] <= prev_cum + 1e-12:
+                continue
+            t = (max(prev_cum, cum[k - 1]) - cum[k - 1]) / (cum[k] - cum[k - 1] + 1e-12)
+            sub_pts.append(g[k - 1] + t * (g[k] - g[k - 1]))
+        if len(sub_pts) >= 2:
+            out_ei.append((prev_node, v))
+            out_geoms.append(np.array(sub_pts))
 
     out_c = out_c + new_nodes
     if added:
