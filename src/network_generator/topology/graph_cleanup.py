@@ -1,32 +1,22 @@
-"""
-Post-growth graph cleanup: dead-end pruning, LCC, angle cleanup, endpoint snapping,
-edge crossing fixing, and parallel road removal.
-
-All functions operate on normalized [0, 1] coordinates unless noted.
-"""
+"""Post-growth graph cleanup operations."""
 
 from __future__ import annotations
 
 import networkx as nx
 import numpy as np
+from shapely.geometry import LineString, Point
+from shapely.ops import split as shapely_split
+from shapely.strtree import STRtree
 
-# ── Building blocks ──────────────────────────────────────────────────
+from utils.geometry import segment_intersection as _segment_intersection
 
-
-def build_nx(coords: np.ndarray, edge_index: np.ndarray) -> nx.Graph:
-    """Build an ``nx.Graph`` with ``pos`` attributes from coords + edges."""
-    G = nx.Graph()
-    for i in range(len(coords)):
-        G.add_node(i, pos=coords[i].copy())
-    G.add_edges_from(edge_index)
-    return G
-
+from .graph_utils import build_nx
 
 # ── Dead-end pruning ─────────────────────────────────────────────────
 
 
 def prune_dead_ends(
-    coords: np.ndarray, edge_index: np.ndarray, max_chain_m: float, map_m: float
+    coords: np.ndarray, edge_index: np.ndarray, max_chain_m: float, map_size_m: float
 ) -> tuple[np.ndarray, np.ndarray]:
     """Remove short dead-end chains by walking from degree-1 tips.
 
@@ -44,13 +34,13 @@ def prune_dead_ends(
                 continue
             tip = n
             cum = 0.0
-            while tip in G and G.degree(tip) == 1 and cum < max_chain_m / map_m:
+            while tip in G and G.degree(tip) == 1 and cum < max_chain_m / map_size_m:
                 nbs = list(G.neighbors(tip))
                 if not nbs:
                     break
                 nb = nbs[0]
                 cum += float(np.linalg.norm(G.nodes[tip]["pos"] - G.nodes[nb]["pos"]))
-                if cum < max_chain_m / map_m:
+                if cum < max_chain_m / map_size_m:
                     G.remove_node(tip)
                     changed = True
                     tip = nb
@@ -152,7 +142,7 @@ def clean_sharp_angles(
 
 
 def snap_endpoints(
-    coords: np.ndarray, edge_index: np.ndarray, map_m: float, snap_dist_m: float = 50.0
+    coords: np.ndarray, edge_index: np.ndarray, map_size_m: float, snap_dist_m: float = 50.0
 ) -> tuple[np.ndarray, np.ndarray]:
     """Snap degree-1 endpoints to the nearest road edge within ``snap_dist_m``."""
     if len(coords) < 5:
@@ -180,7 +170,7 @@ def snap_endpoints(
                 if d < best_dist:
                     best_dist = d
                     best_target = (u, v, proj)
-            if best_target is not None and best_dist < snap_dist_m / map_m:
+            if best_target is not None and best_dist < snap_dist_m / map_size_m:
                 u, v, proj = best_target
                 nid = max(G.nodes()) + 1
                 G.add_node(nid, pos=proj)
@@ -200,95 +190,125 @@ def snap_endpoints(
 # ── Edge crossing fix ────────────────────────────────────────────────
 
 
-def _segment_intersection(p1, p2, q1, q2):
-    """Return the intersection point of two line segments, or ``None``."""
-    x1, y1 = p1
-    x2, y2 = p2
-    x3, y3 = q1
-    x4, y4 = q2
-    denom = (x1 - x2) * (y3 - y4) - (y1 - y2) * (x3 - x4)
-    if abs(denom) < 1e-10:
-        return None
-    t = ((x1 - x3) * (y3 - y4) - (y1 - y3) * (x3 - x4)) / denom
-    u = -((x1 - x2) * (y1 - y3) - (y1 - y2) * (x1 - x3)) / denom
-    if 0 < t < 1 and 0 < u < 1:
-        return np.array([x1 + t * (x2 - x1), y1 + t * (y2 - y1)])
-    return None
-
-
-def fix_edge_crossings(coords, edge_index, geometries, map_m):
+def fix_edge_crossings(coords, edge_index, geometries, map_size_m):
     """Add intersection nodes at every geometric edge crossing.
 
-    Correctly handles geometry splitting so each new edge's geometry
-    traces the full path from its start node to its end node.
+    One-pass variant: crossings are detected among the *original* edges only
+    (spatial-index pruned), then all splits are applied together via
+    ``shapely.ops.split``.  This bounds the work to O(E^2) worst case and
+    avoids the explosive re-scan of newly split edges.  Mirrors the semantics
+    of :func:`fix_growth_crossings`.
     """
     if len(edge_index) < 2:
         return coords, edge_index, geometries
-    added = 0
-    max_n = len(coords)
-    c = [c.copy() for c in coords] if isinstance(coords, np.ndarray) else list(coords)
+
+    c = [np.asarray(p, dtype=float) for p in coords]
     ei = [(int(u), int(v)) for u, v in edge_index]
-    geoms = list(geometries) if isinstance(geometries, list) else list(geometries)
+    geoms = [np.asarray(g, dtype=float) for g in geometries]
 
-    i = 0
-    while i < len(ei):
-        j = i + 1
-        while j < len(ei):
-            u1, v1 = int(ei[i][0]), int(ei[i][1])
-            u2, v2 = int(ei[j][0]), int(ei[j][1])
-            if len({u1, v1} & {u2, v2}) > 0:
-                j += 1
+    def _line(idx):
+        g = geoms[idx]
+        if len(g) >= 2:
+            return LineString(g)
+        u, v = ei[idx]
+        return LineString([c[u], c[v]])
+
+    lines = [_line(i) for i in range(len(ei))]
+    tree = STRtree(lines)
+
+    # Collect crossing points per edge: {edge_idx: set of (x, y) tuples}
+    splits: dict[int, set[tuple]] = {}
+    added = 0
+    for i in range(len(ei)):
+        u1, v1 = ei[i]
+        g1 = geoms[i]
+        for j in tree.query(lines[i]):
+            j = int(j)
+            if j <= i:
                 continue
-
-            g1 = geoms[i] if i < len(geoms) and len(geoms[i]) >= 2 else np.array([c[u1], c[v1]])
-            g2 = geoms[j] if j < len(geoms) and len(geoms[j]) >= 2 else np.array([c[u2], c[v2]])
-            found = False
+            u2, v2 = ei[j]
+            if len({u1, v1} & {u2, v2}) > 0:
+                continue
+            g2 = geoms[j]
             for k in range(len(g1) - 1):
                 p1, p2 = g1[k], g1[k + 1]
                 for l in range(len(g2) - 1):
                     q1, q2 = g2[l], g2[l + 1]
-                    inter = _segment_intersection(p1, p2, q1, q2)
-                    if inter is not None:
-                        nid = max_n + added
-                        c.append(inter)
-
-                        # Split edge i:  [u1, v1] → [u1, nid] + [nid, v1]
-                        ei[i] = (u1, nid)
-                        ei.append((nid, v1))
-                        geoms[i] = np.vstack([g1[: k + 1], inter.reshape(1, -1)])
-                        geoms.append(np.vstack([inter.reshape(1, -1), g1[k + 1 :]]))
-
-                        # Split edge j:  [u2, v2] → [u2, nid] + [nid, v2]
-                        ei[j] = (u2, nid)
-                        ei.append((nid, v2))
-                        geoms[j] = np.vstack([g2[: l + 1], inter.reshape(1, -1)])
-                        geoms.append(np.vstack([inter.reshape(1, -1), g2[l + 1 :]]))
-
+                    intersection_pt = _segment_intersection(p1, p2, q1, q2)
+                    if intersection_pt is not None:
+                        splits.setdefault(i, set()).add(tuple(np.round(intersection_pt, 6)))
+                        splits.setdefault(j, set()).add(tuple(np.round(intersection_pt, 6)))
                         added += 1
-                        found = True
-                        break
-                if found:
-                    break
-            if found:
-                # Recheck from current i with new crossings
-                pass
-            j += 1
-        i += 1
+                        break  # a segment of g1 can only cross g2 once
 
-    return np.array(c), np.array(ei, dtype=np.int64), geoms
+    if added == 0:
+        return coords, edge_index, geometries
+
+    # Global point -> node id map (shared across the two crossing edges).
+    node_of_pt: dict[tuple, int] = {tuple(np.round(p, 6)): int(n) for n, p in enumerate(c)}
+    new_nodes: list[np.ndarray] = []
+
+    def _node(p_tuple):
+        if p_tuple in node_of_pt:
+            return node_of_pt[p_tuple]
+        nid = len(c) + len(new_nodes)
+        node_of_pt[p_tuple] = nid
+        new_nodes.append(np.asarray(p_tuple, dtype=float))
+        return nid
+
+    out_c = list(c)
+    out_ei: list[tuple[int, int]] = []
+    out_geoms: list[np.ndarray] = []
+
+    for idx in range(len(ei)):
+        u, v = ei[idx]
+        if idx not in splits:
+            out_ei.append((u, v))
+            out_geoms.append(geoms[idx])
+            continue
+        pts = sorted(splits[idx], key=lambda p: lines[idx].project(Point(p)))
+        cut_points = [Point(p) for p in pts]
+        parts = shapely_split(
+            lines[idx],
+            (
+                cut_points[0]
+                if len(cut_points) == 1
+                else __import__("shapely.geometry", fromlist=["MultiPoint"]).MultiPoint(cut_points)
+            ),
+        )
+        parts = list(parts.geoms) if hasattr(parts, "geoms") else [parts]
+
+        # Assign endpoints: part 0 starts at u; part -1 ends at v; interior
+        # boundaries are the cut nodes (in order).
+        prev_node = u
+        prev_end = None  # coordinates of the last cut point on this edge
+        for p_idx, part in enumerate(parts):
+            if p_idx < len(parts) - 1:
+                nid = _node(tuple(np.round(part.coords[-1], 6)))
+                out_ei.append((prev_node, nid))
+                out_geoms.append(np.array(part.coords))
+                prev_node = nid
+            else:
+                out_ei.append((prev_node, v))
+                out_geoms.append(np.array(part.coords))
+
+    out_c = out_c + new_nodes
+    if added:
+        print(f"  [FixCrossings] {added} crossing nodes added")
+    return np.array(out_c), np.array(out_ei, dtype=np.int64), out_geoms
 
 
 # ── Parallel road cleanup ────────────────────────────────────────────
 
 
 def clean_parallel_roads(
-    coords, edge_index, geometries, map_m, angle_deg: float = 20.0, max_dist_m: float = 30.0
+    coords, edge_index, geometries, map_size_m, angle_deg: float = 20.0, max_dist_m: float = 30.0
 ):
     """Remove near-parallel roads at a junction whose endpoints are very close."""
     if len(edge_index) < 3:
         return coords, edge_index, geometries
     G = build_nx(coords, edge_index)
-    max_norm = max_dist_m / map_m
+    max_norm = max_dist_m / map_size_m
     to_remove = set()
     for n in range(len(coords)):
         if G.degree(n) < 2:
@@ -339,40 +359,3 @@ def clean_parallel_roads(
         )
         return c, keep_ei, keep_geoms
     return coords.copy(), keep_ei, keep_geoms
-
-
-def remove_short_edges(coords, edge_index, geometries, min_len):
-    """Remove edges shorter than *min_len* (in normalised [0, 1] space).
-
-    Returns filtered (coords, edge_index, geometries). Orphan nodes are
-    removed and indices are remapped.
-    """
-    keep = [True] * len(edge_index)
-    for j, (u, v) in enumerate(edge_index):
-        pts = (
-            geometries[j]
-            if j < len(geometries) and len(geometries[j]) >= 2
-            else np.array([coords[int(u)], coords[int(v)]])
-        )
-        length = sum(np.linalg.norm(pts[k + 1] - pts[k]) for k in range(len(pts) - 1))
-        if length < min_len:
-            keep[j] = False
-    keep_ei = edge_index[keep]
-    keep_geoms = [g for g, k in zip(geometries, keep) if k]
-    # Remove orphaned nodes
-    used = set()
-    for u, v in keep_ei:
-        used.add(int(u))
-        used.add(int(v))
-    orphaned = sorted(set(range(len(coords))) - used)
-    if not orphaned:
-        return coords, keep_ei, keep_geoms
-    c = np.delete(coords, orphaned, axis=0)
-    keep_ei = np.array(
-        [
-            [u - sum(1 for o in orphaned if o < u), v - sum(1 for o in orphaned if o < v)]
-            for u, v in keep_ei
-        ],
-        dtype=np.int64,
-    )
-    return c, keep_ei, keep_geoms

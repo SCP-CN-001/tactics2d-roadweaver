@@ -1,12 +1,4 @@
-"""
-Road network growth — G1 collector roads + A* closure + G2 face infill.
-
-Pipeline:
-  1. G1: seeds sampled along H-edges → bidirectional collector road growth.
-  2. A* endpoint closure: unused G1 endpoints are routed back to the nearest road.
-  3. G2: raster-based face infill — detect empty regions and cut internal roads.
-  4. Final merge: snap G1 nodes onto H-edges.
-"""
+"""Road network growth and infill pipeline."""
 
 from __future__ import annotations
 
@@ -15,14 +7,16 @@ import random
 
 import networkx as nx
 import numpy as np
+from scipy.ndimage import binary_dilation, label
 from shapely.geometry import LineString, Point
+from shapely.strtree import STRtree
 
 from network_generator.topology.pathfinding import astar_connect_path, cost_map_from_road
 
 from .tensor_field import GraphTensorField, normalize
 
 
-def _nid(G: nx.Graph) -> int:
+def _next_node_id(G: nx.Graph) -> int:
     m = -1
     for n in G.nodes:
         if isinstance(n, int) and n > m:
@@ -34,6 +28,7 @@ def _nid(G: nx.Graph) -> int:
 
 
 def to_graph(coords_m, ei, nt, level=0):
+    """Build a NetworkX graph from coords and edges."""
     G = nx.Graph()
     for i, p in enumerate(coords_m):
         G.add_node(i, pos=p.copy())
@@ -46,17 +41,18 @@ def to_graph(coords_m, ei, nt, level=0):
     return G
 
 
-def to_dict(G, map_m):
+def to_dict(G, map_size_m):
+    """Convert a NetworkX graph to array dict."""
     nodes = sorted(G.nodes())
     idx = {n: i for i, n in enumerate(nodes)}
     c = np.array([G.nodes[n]["pos"] for n in nodes], dtype=np.float32)
-    e, rc, el = [], [], []
+    e, road_class, edge_lengths = [], [], []
     deg = {n: 0 for n in nodes}
     for u, v, d in G.edges(data=True):
         e.append([idx[u], idx[v]])
         lv = int(d.get("level", 0))
-        rc.append(min(lv + 1, 3))
-        el.append(float(d.get("length", 1)))
+        road_class.append(min(lv + 1, 3))
+        edge_lengths.append(float(d.get("length", 1)))
         deg[u] += 1
         deg[v] += 1
     e = np.array(e, dtype=np.int64).reshape(-1, 2) if e else np.empty((0, 2), dtype=np.int64)
@@ -64,21 +60,23 @@ def to_dict(G, map_m):
     return {
         "coords": c,
         "edge_index": e,
-        "edge_lengths_m": np.array(el, dtype=np.float32),
-        "road_class": np.array(rc, dtype=np.int64),
+        "edge_lengths_m": np.array(edge_lengths, dtype=np.float32),
+        "road_class": np.array(road_class, dtype=np.int64),
         "node_types": nt,
-        "map_size_m": map_m,
+        "map_size_m": map_size_m,
     }
 
 
-def add_e(G, u, v, level):
+def _add_edge(G, u, v, level):
+    """Add an edge between two nodes if absent."""
     if G.has_edge(u, v):
         return
     pu, pv = G.nodes[u]["pos"], G.nodes[v]["pos"]
     G.add_edge(u, v, geom=LineString([pu, pv]), length=float(np.linalg.norm(pv - pu)), level=level)
 
 
-def split_e(G, u, v, pt):
+def _split_edge_at_point(G, u, v, pt):
+    """Split an edge at a point, returning the new node."""
     if not G.has_edge(u, v):
         return None
     d = G.edges[u, v]
@@ -88,7 +86,7 @@ def split_e(G, u, v, pt):
         return u
     if g.length - da < 1e-6:
         return v
-    nid = _nid(G)
+    nid = _next_node_id(G)
     G.add_node(nid, pos=pt.copy())
     lv = d.get("level", 3)
     G.remove_edge(u, v)
@@ -135,7 +133,7 @@ def gen_seeds(G, config, rng=None):
         for t in t_vals:
             pt = pu + t * ev
             # Split H edge at seed point — node becomes part of H topology
-            nid = split_e(G, u, v, pt)
+            nid = _split_edge_at_point(G, u, v, pt)
             if nid is None:
                 continue
             for sign in (-1.0, 1.0):
@@ -173,9 +171,36 @@ def grow_dir(pos, prev, tf, config, rng=None):
 # ── G1: snap check ────────────────────────────────────────────────────
 
 
-def find_snap(G, pos, p_edges, snap_r, exclude_level=None):
+def find_snap(G, pos, p_edges, snap_r, exclude_level=None, tree=None, edge_pairs=None):
+    """Find the nearest growth edge within ``snap_r`` of ``pos``.
+
+    When ``tree`` / ``edge_pairs`` are provided (built once per G1 step), the
+    edge set is pruned with a spatial index so only geometrically near edges
+    are tested exactly.  Edges that were split/removed since the index was
+    built are skipped via ``G.has_edge``.
+    """
     pt = Point(pos)
     best = None
+
+    if tree is not None and edge_pairs is not None:
+        for idx in tree.query(pt.buffer(snap_r)):
+            u, v = edge_pairs[idx]
+            if (u, v) in p_edges or (v, u) in p_edges:
+                continue
+            if not G.has_edge(u, v):  # edge split since the index was built
+                continue
+            d = G[u][v]
+            if exclude_level is not None and d.get("level", 0) == exclude_level:
+                continue
+            dist = pt.distance(d["geom"])
+            if dist > snap_r:
+                continue
+            proj = np.asarray(d["geom"].interpolate(d["geom"].project(pt)).coords[0])
+            if best is None or dist < best["d"]:
+                best = {"u": u, "v": v, "pt": proj, "d": float(dist)}
+        return best
+
+    # Fallback: full scan (used when no index is supplied).
     for u, v, d in G.edges(data=True):
         if (u, v) in p_edges or (v, u) in p_edges:
             continue
@@ -221,6 +246,17 @@ def grow_g1(G, tf, config, rng=None):
         if not active:
             break
 
+        # Spatial index over current growth edges (level 1), rebuilt each step
+        # because fronts add/split edges as they advance.
+        edge_pairs = []
+        edge_lines = []
+        for u, v, d in G.edges(data=True):
+            if d.get("level", 0) == 0:
+                continue
+            edge_pairs.append((u, v))
+            edge_lines.append(d["geom"])
+        snap_tree = STRtree(edge_lines) if edge_lines else None
+
         new_fronts = []
         for fr in active:
             d = grow_dir(fr["pos"], fr["dir"], tf, config, rng)
@@ -231,17 +267,19 @@ def grow_g1(G, tf, config, rng=None):
                 continue
 
             p_set = {fr["pe"], (fr["pe"][1], fr["pe"][0])}
-            snap = find_snap(G, np_pos, p_set, snap_r, exclude_level=0)
+            snap = find_snap(
+                G, np_pos, p_set, snap_r, exclude_level=0, tree=snap_tree, edge_pairs=edge_pairs
+            )
             if snap is not None:
-                sid = split_e(G, snap["u"], snap["v"], snap["pt"])
+                sid = _split_edge_at_point(G, snap["u"], snap["v"], snap["pt"])
                 if sid is not None and sid != fr["nid"]:
-                    add_e(G, fr["nid"], sid, 1)
+                    _add_edge(G, fr["nid"], sid, 1)
                     fr["alive"] = False
                     continue
 
-            nid = _nid(G)
+            nid = _next_node_id(G)
             G.add_node(nid, pos=np_pos.copy())
-            add_e(G, fr["nid"], nid, 1)
+            _add_edge(G, fr["nid"], nid, 1)
             fr["nid"] = nid
             fr["pos"] = np_pos.copy()
             fr["dir"] = d.copy()
@@ -258,7 +296,7 @@ def close_endpoints(G, road_field, config):
     """A* from each G1 degree-1 endpoint to the nearest road."""
     H, W = (128, 128) if road_field is None else road_field.shape[:2]
     cost = cost_map_from_road(road_field) if road_field is not None else None
-    map_m = config.map_width_m
+    map_size_m = config.map_width_m
 
     # Find G1 endpoints
     deg1 = set()
@@ -275,7 +313,11 @@ def close_endpoints(G, road_field, config):
     max_edges = min(80, len(deg1))
     connected = set()
 
-    # Build candidates sorted by distance
+    # Build candidates sorted by distance (spatial index prunes the per-endpoint
+    # full-edge scan; phase-1 tree is static, phase-2 A* mutations happen after).
+    all_edges = list(G.edges(data=True))
+    edge_tree = STRtree([d["geom"] for _, _, d in all_edges]) if all_edges else None
+
     cand = []
     for ep in sorted(deg1):
         if ep in connected:
@@ -287,15 +329,17 @@ def close_endpoints(G, road_field, config):
             p_set.add((v, u))
 
         best_d, best_t, best_cp = float("inf"), None, None
-        for u, v, d in G.edges(data=True):
-            if (u, v) in p_set or (v, u) in p_set:
-                continue
-            dist = Point(p_ep).distance(d["geom"])
-            if dist < best_d:
-                best_d = dist
-                best_t = (u, v)
-                cp = d["geom"].interpolate(d["geom"].project(Point(p_ep)))
-                best_cp = np.asarray(cp.coords[0])
+        if edge_tree is not None:
+            for idx in edge_tree.query(Point(p_ep).buffer(max_dist)):
+                u, v, d = all_edges[idx]
+                if (u, v) in p_set or (v, u) in p_set:
+                    continue
+                dist = Point(p_ep).distance(d["geom"])
+                if dist < best_d:
+                    best_d = dist
+                    best_t = (u, v)
+                    cp = d["geom"].interpolate(d["geom"].project(Point(p_ep)))
+                    best_cp = np.asarray(cp.coords[0])
         if best_t is None or best_d > max_dist:
             continue
         cand.append((best_d, ep, best_t, best_cp))
@@ -310,25 +354,25 @@ def close_endpoints(G, road_field, config):
 
         # A* if road_field available
         if cost is not None:
-            src_n = G.nodes[ep]["pos"] / map_m
-            tgt_n = cp / map_m
+            src_n = G.nodes[ep]["pos"] / map_size_m
+            tgt_n = cp / map_size_m
             path = astar_connect_path(src_n, tgt_n, road_field, cost, W, H, max_steps=8000)
             if path is not None and len(path) >= 3:
                 prev = ep
-                step_loc = config.g1_step_m / map_m
+                step_loc = config.g1_step_m / map_size_m
                 cum = 0.0
                 for k in range(1, len(path)):
                     ds = float(np.linalg.norm(path[k] - path[k - 1]))
                     cum += ds
                     if cum >= step_loc or k == len(path) - 1:
                         if k == len(path) - 1:
-                            sid = split_e(G, tu, tv, cp)
+                            sid = _split_edge_at_point(G, tu, tv, cp)
                             if sid is not None:
-                                add_e(G, prev, sid, 1)
+                                _add_edge(G, prev, sid, 1)
                         else:
-                            nid = _nid(G)
-                            G.add_node(nid, pos=(path[k] * map_m).copy())
-                            add_e(G, prev, nid, 1)
+                            nid = _next_node_id(G)
+                            G.add_node(nid, pos=(path[k] * map_size_m).copy())
+                            _add_edge(G, prev, nid, 1)
                             prev = nid
                         cum = 0.0
                 connected.add(ep)
@@ -342,9 +386,9 @@ def close_endpoints(G, road_field, config):
         if illegal:
             continue
 
-        sid = split_e(G, tu, tv, cp)
+        sid = _split_edge_at_point(G, tu, tv, cp)
         if sid is not None and sid != ep:
-            add_e(G, ep, sid, 1)
+            _add_edge(G, ep, sid, 1)
             connected.add(ep)
 
     return G
@@ -371,20 +415,26 @@ def final_merge(G, config):
             h_nodes.add(u)
             h_nodes.add(v)
 
+    # Spatial index over H edges: only test edges whose geometry passes within
+    # the snap threshold of the node (avoids O(g1 × h_edges) Shapely scans).
+    h_tree = STRtree([d["geom"] for _, _, d in h_edges]) if h_edges else None
+
     for g1n in sorted(g1_nodes):
         if g1n in h_nodes:
             continue
         pg = G.nodes[g1n]["pos"]
         best_d, best_info = float("inf"), None
-        for hu, hv, hd in h_edges:
-            dist = Point(pg).distance(hd["geom"])
-            if dist < best_d:
-                best_d = dist
-                cp = hd["geom"].interpolate(hd["geom"].project(Point(pg)))
-                best_info = (hu, hv, np.asarray(cp.coords[0]))
+        if h_tree is not None:
+            for idx in h_tree.query(Point(pg).buffer(snap_r * 0.8)):
+                hu, hv, hd = h_edges[idx]
+                dist = Point(pg).distance(hd["geom"])
+                if dist < best_d:
+                    best_d = dist
+                    cp = hd["geom"].interpolate(hd["geom"].project(Point(pg)))
+                    best_info = (hu, hv, np.asarray(cp.coords[0]))
         if best_d < snap_r * 0.8 and best_info is not None:
             hu, hv, cp = best_info
-            sid = split_e(G, hu, hv, cp)
+            sid = _split_edge_at_point(G, hu, hv, cp)
             if sid is not None and sid != g1n:
                 nbrs = list(G.neighbors(g1n))
                 for nb in nbrs:
@@ -392,7 +442,7 @@ def final_merge(G, config):
                         lv = G.edges[g1n, nb].get("level", 1)
                         G.remove_edge(g1n, nb)
                         if not G.has_edge(sid, nb):
-                            add_e(G, sid, nb, lv)
+                            _add_edge(G, sid, nb, lv)
                 G.remove_node(g1n)
 
     return G
@@ -401,33 +451,31 @@ def final_merge(G, config):
 # ── G2: raster ────────────────────────────────────────────────────────
 
 
-def _empty_regs(G, map_m, min_a, res=64):
-    from scipy.ndimage import binary_dilation, label
-
-    cm = map_m / res
+def _find_empty_regions(G, map_size_m, min_area, res=64):
+    cell_size_m = map_size_m / res
     occ = np.zeros((res, res), dtype=bool)
     for _, _, d in G.edges(data=True):
         g = d["geom"]
-        n = max(2, int(np.ceil(g.length / cm)))
+        n = max(2, int(np.ceil(g.length / cell_size_m)))
         for k in range(n):
             pt = np.asarray(g.interpolate(k * g.length / max(n - 1, 1)).coords[0])
-            cx = int(np.clip(pt[0] / cm, 0, res - 1))
-            cy = int(np.clip(pt[1] / cm, 0, res - 1))
+            cx = int(np.clip(pt[0] / cell_size_m, 0, res - 1))
+            cy = int(np.clip(pt[1] / cell_size_m, 0, res - 1))
             occ[cy, cx] = True
     occ = binary_dilation(occ, iterations=2)
     lab, nl = label(~occ)
     regs = []
     for li in range(1, nl + 1):
         mask = lab == li
-        a = float(mask.sum()) * cm**2
-        if a < min_a:
+        a = float(mask.sum()) * cell_size_m**2
+        if a < min_area:
             continue
         ys, xs = np.where(mask)
         regs.append(
             (
-                np.array([float(np.mean(ys)) * cm, float(np.mean(xs)) * cm]),
-                float(ys.max() - ys.min() + 1) * cm,
-                float(xs.max() - xs.min() + 1) * cm,
+                np.array([float(np.mean(ys)) * cell_size_m, float(np.mean(xs)) * cell_size_m]),
+                float(ys.max() - ys.min() + 1) * cell_size_m,
+                float(xs.max() - xs.min() + 1) * cell_size_m,
             )
         )
     regs.sort(key=lambda r: -r[1] * r[2])
@@ -435,11 +483,12 @@ def _empty_regs(G, map_m, min_a, res=64):
 
 
 def grow_g2(G, tf, config, rng=None):
-    map_m = config.map_width_m
+    """Fill empty regions with G2 infill roads."""
+    map_size_m = config.map_width_m
     if rng is None:
         rng = random.Random(config.random_seed + 1)
     for _ in range(config.g2_max_cuts_per_pass * 5):
-        regs = _empty_regs(G, map_m, config.g2_min_face_area_m2)
+        regs = _find_empty_regions(G, map_size_m, config.g2_min_face_area_m2)
         if not regs:
             break
         cut = False
@@ -455,15 +504,15 @@ def grow_g2(G, tf, config, rng=None):
             if hf < config.g2_min_cut_length_m * 0.5:
                 continue
             p0, p1 = c - d * hf, c + d * hf
-            e0 = _nearest(G, p0)
-            e1 = _nearest(G, p1)
-            n0 = split_e(G, e0[0], e0[1], p0)
-            n1 = split_e(G, e1[0], e1[1], p1)
+            e0 = _nearest_edge(G, p0)
+            e1 = _nearest_edge(G, p1)
+            n0 = _split_edge_at_point(G, e0[0], e0[1], p0)
+            n1 = _split_edge_at_point(G, e1[0], e1[1], p1)
             if n0 is None:
-                n0 = _nid(G)
+                n0 = _next_node_id(G)
                 G.add_node(n0, pos=p0.copy())
             if n1 is None:
-                n1 = _nid(G)
+                n1 = _next_node_id(G)
                 G.add_node(n1, pos=p1.copy())
             if n0 == n1:
                 continue
@@ -475,7 +524,7 @@ def grow_g2(G, tf, config, rng=None):
             )
             if not ok:
                 continue
-            add_e(G, n0, n1, 2)
+            _add_edge(G, n0, n1, 2)
             cut = True
             break
         if not cut:
@@ -483,7 +532,7 @@ def grow_g2(G, tf, config, rng=None):
     return G
 
 
-def _nearest(G, pt):
+def _nearest_edge(G, pt):
     p = Point(pt)
     best, bd = None, float("inf")
     for u, v, d in G.edges(data=True):
@@ -497,6 +546,7 @@ def _nearest(G, pt):
 
 
 def grow(coords_m, ei, nt, road_field, config):
+    """Grow a road network from an H-graph."""
     G = to_graph(coords_m, ei, nt, level=0)
     tf = GraphTensorField.from_h_graph(
         coords_m,
@@ -517,33 +567,3 @@ def grow(coords_m, ei, nt, road_field, config):
     # Final cleanup: snap G1 nodes to H edges
     G = final_merge(G, config)
     return to_dict(G, config.map_width_m)
-
-
-def assign_attributes(graph: dict, config) -> dict:
-    """Add per-edge attributes: lanes, bidirectional, speed, surface."""
-    rc = graph.get("road_class", np.ones(len(graph["edge_index"]), dtype=np.int64))
-    E = len(graph["edge_index"])
-
-    lanes = np.zeros(E, dtype=np.int64)
-    bidirectional = np.ones(E, dtype=bool)
-    speed = np.zeros(E, dtype=np.int64)
-    surface = np.full(E, "paved", dtype=object)
-
-    for ei in range(E):
-        cls = int(rc[ei])
-        if cls == 1:
-            lanes[ei] = config.arterial_lanes_per_dir
-            speed[ei] = 60
-        elif cls == 2:
-            lanes[ei] = config.collector_lanes_per_dir
-            speed[ei] = 40
-        else:
-            lanes[ei] = config.local_lanes_per_dir
-            speed[ei] = 20
-        bidirectional[ei] = True
-
-    graph["lanes_per_dir"] = lanes
-    graph["bidirectional"] = bidirectional
-    graph["speed_limit_kmh"] = speed
-    graph["surface"] = surface
-    return graph

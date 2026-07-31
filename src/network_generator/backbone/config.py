@@ -1,12 +1,10 @@
-"""
-Backbone — configuration.
-
-Centralised hyper-parameters shared across backbone generation modules.
-"""
+"""Backbone configuration hyper-parameters."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+
+from utils.patterns import PATTERN_NAMES  # noqa: F401  (re-exported for callers)
 
 
 @dataclass
@@ -45,9 +43,6 @@ class BackboneConfig:
     # Options: 'bearing' | 'distance' | 'index'.
     bfs_neighbor_sort_by: str = "bearing"
 
-
-# Pattern names (shared across the project).
-PATTERN_NAMES = ["Gridiron", "Linear", "No pattern", "Organic", "Radial", "Tributary"]
 
 # Singleton.
 CONFIG = BackboneConfig()

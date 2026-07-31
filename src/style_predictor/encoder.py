@@ -71,6 +71,7 @@ class StyleEncoder(nn.Module):
             print(f"  [StyleEncoder] WARNING: No matching backbone keys in {path}")
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Encode an image into a style vector."""
         features = self.backbone(x)
         return F.softmax(self.head(features), dim=-1)
 

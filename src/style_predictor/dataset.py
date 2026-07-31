@@ -49,9 +49,11 @@ class CRHDDataset(Dataset):
         self.image_size = image_size
 
     def __len__(self) -> int:
+        """Return the number of samples."""
         return len(self.samples)
 
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """Load and return one image-label sample."""
         img_path, label = self.samples[idx]
         img = load_image(img_path, size=self.image_size)
         return torch.from_numpy(to_tensor(img)), torch.from_numpy(label)

@@ -1,9 +1,4 @@
-"""
-Field reconstruction loss: BCE + Dice + orientation L1 + focal + distance L1.
-
-Uses built-in PyTorch losses where available (BCEWithLogitsLoss, L1Loss)
-and torchvision's sigmoid_focal_loss for junction/endpoint heatmaps.
-"""
+"""Field and codebook training losses."""
 
 from __future__ import annotations
 
@@ -20,6 +15,7 @@ class DiceLoss(nn.Module):
         self.smooth = smooth
 
     def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """Compute smooth Dice loss for binary masks."""
         pred = pred.flatten(1)
         target = target.flatten(1)
         num = 2 * (pred * target).sum(dim=1) + self.smooth
@@ -47,6 +43,7 @@ class FieldLoss(nn.Module):
         self.road_weight = road_weight
 
     def forward(self, logits: torch.Tensor, target: torch.Tensor) -> dict:
+        """Compute full multi-channel field loss."""
         pred = torch.sigmoid(logits)
         road_pred = pred[:, 0]
         road_tgt = target[:, 0]

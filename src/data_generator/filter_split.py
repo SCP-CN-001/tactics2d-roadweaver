@@ -1,30 +1,4 @@
-"""
-Urban Structural Prior Dataset — Filtering and Train/Val/Test Split.
-
-Reads the flat Parquet from data_generator.py, applies quality and
-percentile-based numeric filters, optionally merges style predictions,
-and writes random splits.
-
-Outputs (under output-dir):
-    train.parquet       — 80 %
-    val.parquet         — 10 %
-    test.parquet        — 10 %
-    split_summary.json  — counts, filter reasons
-
-Usage:
-    python -m data_generator.filter_split \
-        --parquet data/urban_prior/urban_prior.parquet \
-        --output-dir data/urban_prior/splits \
-        --seed 42
-
-    With style filtering:
-    python -m data_generator.filter_split \
-        --parquet data/urban_prior/urban_prior.parquet \
-        --style-predictions data/crhd_5km_style_predictions.json \
-        --confidence-threshold 0.7 \
-        --output-dir data/urban_prior/splits \
-        --seed 42
-"""
+"""Urban prior dataset filtering and splitting."""
 
 from __future__ import annotations
 
@@ -46,6 +20,7 @@ NUMERIC_FILTER_COLS = [
 
 
 def parse_args(argv=None):
+    """Parse command-line arguments for filtering."""
     parser = argparse.ArgumentParser(description="Filter and split Urban Prior Dataset")
     parser.add_argument("--parquet", default="data/urban_prior/urban_prior.parquet")
     parser.add_argument("--output-dir", default="data/urban_prior/splits")
@@ -71,6 +46,7 @@ def _extract_patch_id(path: str) -> str:
 
 
 def main():
+    """Filter and split the urban prior dataset."""
     args = parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
 

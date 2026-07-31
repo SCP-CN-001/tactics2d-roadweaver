@@ -1,9 +1,4 @@
-"""
-OSM road graph construction and analysis utilities.
-
-Functions for loading, building, clipping, and analyzing
-OpenStreetMap road networks for structural prior computation.
-"""
+"""OSM road graph construction and analysis utilities."""
 
 from __future__ import annotations
 

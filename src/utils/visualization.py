@@ -1,21 +1,9 @@
-"""
-Shared visualization utilities for road skeleton graph generation and refinement.
+"""Road graph and field visualization utilities."""
 
-Provides reusable plotting patterns:
-  - plot_field:                single road field → PNG
-  - plot_graph:                single skeleton graph → PNG
-  - compare_field_graph:       field vs extracted graph side-by-side → PNG
-  - field_grid:                N conditions x M seeds road field grid
-  - field_to_graph_viz:        field vs raw vs refined graph grid
-  - diversity_bars:            N/E counts per seed bar chart
-  - plot_refine_comparison:    before/after refinement overlay
-  - plot_score_breakdown:      bar chart of scoring dimensions
-  - plot_pick_best_summary:    top-k scores across seeds grid
-  - plot_refine_comparison_grid: grid of (field, raw, refined) triples
-"""
+from __future__ import annotations
 
 import os
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import matplotlib
 
@@ -36,17 +24,31 @@ NODE_COLORS = {
 # ---------------------------------------------------------------------------
 
 
+def _draw_field(
+    ax: plt.Axes,
+    field: np.ndarray,
+    *,
+    cmap: str = "gray_r",
+    origin: str = "upper",
+    extent: tuple[float, float, float, float] | None = None,
+    vmin: float = 0.0,
+    vmax: float = 1.0,
+) -> None:
+    """Render a road field onto an existing axis."""
+    ax.imshow(field, cmap=cmap, vmin=vmin, vmax=vmax, origin=origin, extent=extent)
+
+
 def plot_field(
     field: np.ndarray,
     save_path: str,
     title: str = "",
     cmap: str = "gray_r",
-    figsize: Tuple[int, int] = (5, 5),
+    figsize: tuple[int, int] = (5, 5),
     dpi: int = 300,
 ) -> None:
     os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
     fig, ax = plt.subplots(1, 1, figsize=figsize)
-    ax.imshow(field, cmap=cmap, vmin=0, vmax=1)
+    _draw_field(ax, field, cmap=cmap)
     if title:
         ax.set_title(title, fontsize=10)
     ax.axis("off")
@@ -66,7 +68,7 @@ def plot_graph(
     node_types: np.ndarray,
     save_path: str,
     title: str = "",
-    figsize: Tuple[int, int] = (5, 5),
+    figsize: tuple[int, int] = (5, 5),
     dpi: int = 300,
     show_labels: bool = True,
 ) -> None:
@@ -84,33 +86,56 @@ def plot_graph(
 
 
 def _draw_graph(
-    ax: plt.Axes, coords: np.ndarray, edge_index: np.ndarray, node_types: np.ndarray
+    ax: plt.Axes,
+    coords: np.ndarray,
+    edge_index: np.ndarray,
+    node_types: np.ndarray,
+    *,
+    edge_color: str = "#666",
+    edge_lw: float = 0.8,
+    edge_alpha: float = 0.5,
+    node_color: str | None = None,
+    node_size: int | Callable[[int], int] = 12,
+    fixed_limits: tuple[float, float, float, float] | None = (0.0, 0.0, 1.0, 1.0),
+    hide_axes: bool = True,
 ) -> None:
+    """Render a graph (edges + nodes) onto an existing axis.
+
+    ``node_color`` overrides per-type ``NODE_COLORS`` with a single color;
+    ``node_size`` may be an int or a callable of ``len(coords)``;
+    ``fixed_limits=(x0, y0, x1, y1)`` fixes axis limits, ``None`` auto-pads.
+    """
     if len(coords) == 0:
         return
     for ii, jj in edge_index:
         ax.plot(
             [coords[ii, 0], coords[jj, 0]],
             [coords[ii, 1], coords[jj, 1]],
-            color="#666",
-            lw=0.8,
-            alpha=0.5,
+            color=edge_color,
+            lw=edge_lw,
+            alpha=edge_alpha,
             zorder=1,
         )
-    for n_idx in range(len(coords)):
-        ax.scatter(
-            coords[n_idx, 0],
-            coords[n_idx, 1],
-            c=NODE_COLORS.get(int(node_types[n_idx]), "#888"),
-            s=12,
-            zorder=2,
-            edgecolors="black",
-            lw=0.3,
-        )
-    ax.set_xlim(0, 1)
-    ax.set_ylim(0, 1)
+    colors = (
+        [node_color] * len(coords)
+        if node_color is not None
+        else [NODE_COLORS.get(int(t), "#888") for t in node_types]
+    )
+    size = node_size(len(coords)) if callable(node_size) else node_size
+    ax.scatter(coords[:, 0], coords[:, 1], c=colors, s=size, zorder=2, edgecolors="black", lw=0.3)
+    if fixed_limits is None:
+        x0, y0 = coords.min(axis=0)
+        x1, y1 = coords.max(axis=0)
+        padx = max((x1 - x0) * 0.05, 1e-9)
+        pady = max((y1 - y0) * 0.05, 1e-9)
+        ax.set_xlim(x0 - padx, x1 + padx)
+        ax.set_ylim(y0 - pady, y1 + pady)
+    else:
+        ax.set_xlim(fixed_limits[0], fixed_limits[2])
+        ax.set_ylim(fixed_limits[1], fixed_limits[3])
     ax.set_aspect("equal")
-    ax.axis("off")
+    if hide_axes:
+        ax.axis("off")
 
 
 # ---------------------------------------------------------------------------
@@ -125,13 +150,13 @@ def compare_field_graph(
     node_types: np.ndarray,
     save_path: str,
     title: str = "",
-    figsize: Tuple[int, int] = (10, 5),
+    figsize: tuple[int, int] = (10, 5),
     dpi: int = 300,
 ) -> None:
     os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
     fig, (ax_l, ax_r) = plt.subplots(1, 2, figsize=figsize)
 
-    ax_l.imshow(field, cmap="gray_r", vmin=0, vmax=1)
+    _draw_field(ax_l, field)
     ax_l.set_title("Road Field", fontsize=10)
     ax_l.axis("off")
 
@@ -154,7 +179,7 @@ def field_grid(
     fields: Sequence[np.ndarray],
     titles: Sequence[str],
     n_cols: int = 4,
-    figsize: Tuple[int, int] = (16, 10),
+    figsize: tuple[int, int] = (16, 10),
     suptitle: str = "",
     cmap: str = "gray_r",
 ) -> plt.Figure:
@@ -163,7 +188,7 @@ def field_grid(
     axes = axes.flatten() if n_rows * n_cols > 1 else [axes]
 
     for i in range(len(fields)):
-        axes[i].imshow(fields[i], cmap=cmap, vmin=0, vmax=1)
+        _draw_field(axes[i], fields[i], cmap=cmap)
         axes[i].set_title(titles[i], fontsize=9)
         axes[i].axis("off")
 
@@ -187,18 +212,18 @@ def field_to_graph_viz(
     edge_indices: Sequence[np.ndarray],
     node_types_list: Sequence[np.ndarray],
     labels: Sequence[str],
-    figsize: Tuple[int, int] = (10, 8),
+    figsize: tuple[int, int] = (10, 8),
     suptitle: str = "",
-    ref_coords_list: Optional[Sequence[np.ndarray]] = None,
-    ref_edge_indices: Optional[Sequence[np.ndarray]] = None,
-    ref_node_types_list: Optional[Sequence[np.ndarray]] = None,
+    ref_coords_list: Sequence[np.ndarray] | None = None,
+    ref_edge_indices: Sequence[np.ndarray] | None = None,
+    ref_node_types_list: Sequence[np.ndarray] | None = None,
 ) -> plt.Figure:
     n = len(fields)
     n_cols = 3 if ref_coords_list is not None else 2
     fig, axes = plt.subplots(n, n_cols, figsize=figsize)
 
     for i in range(n):
-        axes[i, 0].imshow(fields[i], cmap="gray_r", vmin=0, vmax=1)
+        _draw_field(axes[i, 0], fields[i])
         axes[i, 0].set_title(f"Field {labels[i]}", fontsize=9)
         axes[i, 0].axis("off")
 
@@ -224,8 +249,8 @@ def field_to_graph_viz(
 
 def plot_refine_comparison(
     road_field: np.ndarray,
-    raw_graph: Dict,
-    ref_graph: Dict,
+    raw_graph: dict,
+    ref_graph: dict,
     save_path: str,
     title: str = "",
     dpi: int = 300,
@@ -264,12 +289,12 @@ def plot_refine_comparison(
 
 def plot_refine_comparison_grid(
     fields: Sequence[np.ndarray],
-    raw_graphs: Sequence[Dict],
-    ref_graphs: Sequence[Dict],
+    raw_graphs: Sequence[dict],
+    ref_graphs: Sequence[dict],
     labels: Sequence[str],
     save_path: str,
     suptitle: str = "",
-    figsize: Tuple[int, int] = (14, 10),
+    figsize: tuple[int, int] = (14, 10),
     dpi: int = 300,
 ) -> None:
     os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)

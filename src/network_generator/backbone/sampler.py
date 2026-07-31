@@ -1,12 +1,8 @@
-"""
-Anchor-based code map retrieval and anchor token sampling.
-
-Retrieves similar code maps from a training cache using
-pattern-aware + density-aware bucketing, then samples a subset
-of their tokens as anchors for masked code completion.
-"""
+"""Anchor code map retrieval and sampling."""
 
 from __future__ import annotations
+
+import pickle
 
 import numpy as np
 import torch
@@ -41,8 +37,6 @@ class AnchorSampler:
         self.mask_token_id = 511  # safe default, overridden by Generator
 
         if self.use_clusters:
-            import pickle
-
             data = np.load(cluster_cache_path + "/centroids.npz")
             self.cond_db = torch.from_numpy(data["centroids"])
             with open(cluster_cache_path + "/sources.pkl", "rb") as f:

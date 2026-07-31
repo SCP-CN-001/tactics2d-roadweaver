@@ -1,8 +1,4 @@
-"""
-Pathfinding on road field: A*, road snapping, path sampling at intervals.
-
-All coordinates are in [0, 1] normalized space unless specified as pixels.
-"""
+"""Pathfinding on road fields and grids."""
 
 from __future__ import annotations
 

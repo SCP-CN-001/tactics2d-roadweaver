@@ -1,18 +1,5 @@
 #!/usr/bin/env python3
-"""Build the Urban Structural Prior Dataset as a flat Parquet table.
-
-Pipeline:
-1. Read patch manifest (CRHD images with centroids).
-2. Group patches by city, load OSM road networks.
-3. Process each city in parallel: clip roads → extract priors → flatten.
-4. Write a single Parquet file with numeric columns + skeleton graph as JSON string.
-
-Usage:
-    PYTHONPATH=src:$PYTHONPATH python src/data_generator/data_generator.py \
-        --crhd-root data/crhd_2km_context_600x600 \
-        --output data/urban_prior/urban_prior.parquet \
-        --context-size-m 2000 --image-size 600
-"""
+"""Parquet dataset builder for urban priors."""
 
 from __future__ import annotations
 
@@ -45,6 +32,7 @@ logger = logging.getLogger("data_generator")
 
 
 def parse_args():
+    """Parse command-line arguments for the builder."""
     parser = argparse.ArgumentParser(
         description="Build Urban Structural Prior Dataset (Parquet output)"
     )
@@ -216,6 +204,7 @@ def _worker_city(city_args: tuple) -> list:
 
 
 def main():
+    """Build the urban prior Parquet dataset."""
     args = parse_args()
 
     logger.info("=" * 60)

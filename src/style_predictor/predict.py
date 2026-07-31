@@ -1,13 +1,5 @@
 #!/usr/bin/env python3
-"""
-Predict city style vectors from CRHD images using a trained style encoder.
-
-Usage:
-    python -m style_predictor.predict \
-        --input data/crhd_2km \
-        --checkpoint checkpoints/style_encoder/best.pth \
-        --output data/crhd_2km_style_predictions.json
-"""
+"""Predict city style vectors from CRHD images."""
 
 from __future__ import annotations
 
@@ -18,11 +10,11 @@ import os
 import numpy as np
 import torch
 
+from utils.patterns import PATTERN_NAMES, STYLE_DIM
+
 from .dataset import load_image, to_tensor
 from .encoder import build_encoder
 
-PATTERN_NAMES = ["Gridiron", "Linear", "No pattern", "Organic", "Radial", "Tributary"]
-STYLE_DIM = 6
 IMAGE_SIZE = 224
 
 
@@ -45,6 +37,7 @@ def _save_json(data, path: str):
 
 
 def main():
+    """Run style prediction from the CLI."""
     parser = argparse.ArgumentParser(description="Predict city style vectors")
     parser.add_argument("--input", type=str, required=True, help="Image file or directory")
     parser.add_argument(

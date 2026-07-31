@@ -22,9 +22,9 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 from tqdm import tqdm
 
 import wandb
-from loss import FieldLoss
 from network_generator.backbone.config import CONFIG
 from network_generator.backbone.dataset import make_field_dataloader
+from network_generator.backbone.loss import FieldLoss
 from network_generator.backbone.vq_vae import VQVAE
 
 DEFAULT_CONFIG = "config_vq_vae.yaml"

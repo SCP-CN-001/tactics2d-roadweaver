@@ -1,63 +1,93 @@
-"""
-RoadWeaver graph generation pipeline — two-phase design.
-
-Phase 1 — ``generate_skeleton``:  VQ + Transformer → raw skeleton → clean → scale
-Phase 2 — ``generate_branch``:     Growth → cleanup → compress → classify → lanes
-
-Usage::
-
-    from generate_graph import generate_skeleton, generate_branch
-
-    skeleton = generate_skeleton(gen, cond, struct, map_w=2000, map_h=2000)
-    result   = generate_branch(*skeleton, cond, map_w=2000, map_h=2000)
-    # result == {"coords_int", "edge_index_int", "node_types", "lanes", "geoms", "road_class"}
-"""
+"""Compressed-graph refinement operations."""
 
 from __future__ import annotations
 
-from typing import Any
-
+import networkx as nx
 import numpy as np
-import torch
+from shapely import simplify as shapely_simplify
+from shapely.geometry import LineString, Point, box
+from shapely.strtree import STRtree
 
-from network_generator.growth.config import GrowthConfig
-from network_generator.growth.growth import grow
-from network_generator.topology.connector import EndpointConnector
-from network_generator.topology.graph_cleanup import (
-    clean_parallel_roads,
-    clean_sharp_angles,
-    fix_edge_crossings,
-    keep_lcc,
-    prune_dead_ends,
-    snap_endpoints,
-)
-from network_generator.topology.graph_ops import (
-    classify_nodes,
-    compress_to_intersection_graph,
-    merge_close_nodes,
-    simplify_chains,
-)
+from utils.geometry import segment_intersection as _segment_intersection
 
-# ── Growth-graph crossing fix ────────────────────────────────────
+from .graph_utils import build_nx
 
 
-def _segment_intersection(a, b, c, d):
-    """Return intersection point of segments ab and cd, or ``None``."""
-    x1, y1 = a
-    x2, y2 = b
-    x3, y3 = c
-    x4, y4 = d
-    denom = (x1 - x2) * (y3 - y4) - (y1 - y2) * (x3 - x4)
-    if abs(denom) < 1e-12:
-        return None
-    t = ((x1 - x3) * (y3 - y4) - (y1 - y3) * (x3 - x4)) / denom
-    u = -((x1 - x2) * (y1 - y3) - (y1 - y2) * (x1 - x3)) / denom
-    if 0 < t < 1 and 0 < u < 1:
-        return np.array([x1 + t * (x2 - x1), y1 + t * (y2 - y1)])
-    return None
+# ===== moved from the old top-level pipeline module =====
+def clean_growth_parallels(coords, edge_index, map_size_m, angle_deg=20.0, max_dist_m=30.0):
+    """Remove near-parallel non-adjacent edges in the growth graph (no geometries)."""
+    adj = {i: set() for i in range(len(coords))}
+    for u, v in edge_index:
+        adj[int(u)].add(int(v))
+        adj[int(v)].add(int(u))
+    angle_rad = np.radians(angle_deg)
+    norm_d = max_dist_m / map_size_m
+    n = len(edge_index)
+    to_rm = set()
+
+    # Spatial index: prune candidate pairs to those whose bounding boxes come
+    # within norm_d of edge i (O(E log E) instead of O(E²)).  Candidate order
+    # is kept ascending to preserve the exact removal sequence of the old loop.
+    edge_lines = [LineString([coords[int(u)], coords[int(v)]]) for u, v in edge_index]
+    tree = STRtree(edge_lines)
+
+    for i in range(n):
+        if i in to_rm:
+            continue
+        u1, v1 = int(edge_index[i, 0]), int(edge_index[i, 1])
+        d1 = coords[v1] - coords[u1]
+        l1 = float(np.linalg.norm(d1))
+        if l1 < 1e-12:
+            continue
+            d1 /= l1
+        xmin, ymin, xmax, ymax = edge_lines[i].bounds
+        q = box(xmin - norm_d, ymin - norm_d, xmax + norm_d, ymax + norm_d)
+        for j in sorted(tree.query(q)):
+            j = int(j)
+            if j <= i or j in to_rm:
+                continue
+            u2, v2 = int(edge_index[j, 0]), int(edge_index[j, 1])
+            if {u1, v1} & {u2, v2}:
+                continue
+            d2 = coords[v2] - coords[u2]
+            l2 = float(np.linalg.norm(d2))
+            if l2 < 1e-12:
+                continue
+                d2 /= l2
+            ang = abs(np.arccos(np.clip(float(d1 @ d2), -1, 1)))
+            if ang > angle_rad and abs(ang - np.pi) > angle_rad:
+                continue
+            md = min(
+                np.linalg.norm(coords[u1] - coords[u2]),
+                np.linalg.norm(coords[u1] - coords[v2]),
+                np.linalg.norm(coords[v1] - coords[u2]),
+                np.linalg.norm(coords[v1] - coords[v2]),
+            )
+            if md > norm_d:
+                continue
+            to_rm.add(i if l1 <= l2 else j)
+    if not to_rm:
+        return coords, edge_index
+    keep = edge_index[[j for j in range(n) if j not in to_rm]]
+    used = set()
+    for u, v in keep:
+        used.add(int(u))
+        used.add(int(v))
+    orphaned = sorted(set(range(len(coords))) - used)
+    if orphaned:
+        c = np.delete(coords, orphaned, axis=0)
+        keep = np.array(
+            [
+                [u - sum(1 for o in orphaned if o < u), v - sum(1 for o in orphaned if o < v)]
+                for u, v in keep
+            ],
+            dtype=np.int64,
+        )
+        return c, keep
+    return coords.copy(), keep
 
 
-def _fix_growth_crossings(coords, edge_index, map_max):
+def fix_growth_crossings(coords, edge_index, map_size_m):
     """Add nodes where non-adjacent growth-graph edges cross."""
     adj = {i: set() for i in range(len(coords))}
     for u, v in edge_index:
@@ -67,10 +97,19 @@ def _fix_growth_crossings(coords, edge_index, map_max):
     new_c = list(coords)
     # Track edge splits: each crossing splits both edges, creating 2 new edges each
     splits = {}  # {old_edge_idx: [(fraction, node_idx), ...]}
+
+    # Spatial index: only test pairs whose bounding boxes overlap (O(E log E)
+    # instead of O(E²)).  Exact segment intersection is still verified below.
+    edge_lines = [LineString([coords[int(u)], coords[int(v)]]) for u, v in edge_index]
+    tree = STRtree(edge_lines)
+
     for i in range(len(edge_index)):
         u1, v1 = int(edge_index[i, 0]), int(edge_index[i, 1])
         p1, p2 = coords[u1], coords[v1]
-        for j in range(i + 1, len(edge_index)):
+        for j in tree.query(edge_lines[i]):
+            j = int(j)
+            if j <= i:  # avoid self and double-counting (i, j) / (j, i)
+                continue
             u2, v2 = int(edge_index[j, 0]), int(edge_index[j, 1])
             if {u1, v1} & {u2, v2}:
                 continue
@@ -106,14 +145,12 @@ def _fix_growth_crossings(coords, edge_index, map_max):
 # ── Abnormal edge fix ────────────────────────────────────────────
 
 
-def fix_abnormal_edges(coords, edge_index, geometries, map_max):
+def fix_abnormal_edges(coords, edge_index, geometries, map_size_m):
     """Detect and repair self-intersecting or overly-curved edge geometries.
 
     Modifies *geometries* in-place by simplifying self-intersecting polylines
     and capping curvature via Douglas-Peucker simplification.
     """
-    from shapely import simplify as shapely_simplify
-    from shapely.geometry import LineString
 
     for j in range(len(edge_index)):
         if j >= len(geometries) or len(geometries[j]) < 3:
@@ -122,7 +159,7 @@ def fix_abnormal_edges(coords, edge_index, geometries, map_max):
         ls = LineString(geom)
         if not ls.is_simple:
             # Self-intersecting — simplify with DP tolerance
-            simplified = shapely_simplify(ls, tolerance=0.002 * map_max / 2000.0)
+            simplified = shapely_simplify(ls, tolerance=0.002)
             if simplified.geom_type == "LineString" and len(simplified.coords) >= 2:
                 geometries[j] = np.array(simplified.coords)
             else:
@@ -137,16 +174,15 @@ def merge_compressed_graph(
     coords: np.ndarray,
     edge_index: np.ndarray,
     geometries: list[np.ndarray],
-    map_max: float,
+    map_size_m: float,
     merge_dist_m: float = 30.0,
 ) -> tuple[np.ndarray, np.ndarray, list[np.ndarray]]:
     """Merge compressed-graph nodes closer than *merge_dist_m*."""
     if len(coords) < 2:
         return coords, edge_index, geometries
 
-    dist_norm = merge_dist_m / map_max
+    dist_norm = merge_dist_m / map_size_m
     N = len(coords)
-    import networkx as nx
 
     G = nx.Graph()
     for i in range(N):
@@ -215,7 +251,9 @@ def merge_compressed_graph(
 # ── Merge nearby junction nodes (physical graph merge) ───────────
 
 
-def merge_nearby_junctions(coords, edge_index, node_types, geometries, map_max, merge_dist_m=50.0):
+def merge_nearby_junctions(
+    coords, edge_index, node_types, geometries, map_size_m, merge_dist_m=50.0
+):
     """Physically merge junction nodes closer than *merge_dist_m*.
 
     Unlike classify_nodes which only conceptually groups them, this
@@ -225,16 +263,19 @@ def merge_nearby_junctions(coords, edge_index, node_types, geometries, map_max, 
     if len(coords) < 2:
         return coords, edge_index, node_types, geometries
 
-    norm = merge_dist_m / map_max
-    junctions = [i for i, t in enumerate(node_types) if int(t) == 1]
-    if len(junctions) < 2:
-        return coords, edge_index, node_types, geometries
+    norm = merge_dist_m / map_size_m
 
     # Build adjacency
     adj = {i: set() for i in range(len(coords))}
     for u, v in edge_index:
         adj[int(u)].add(int(v))
         adj[int(v)].add(int(u))
+
+    # Use degree >= 3 to identify junction nodes (not node_types, which may
+    # have been pre-emptively degrouped by classify_nodes).
+    junctions = [i for i in range(len(coords)) if len(adj[i]) >= 3]
+    if len(junctions) < 2:
+        return coords, edge_index, node_types, geometries
 
     # Group nearby junctions
     merged_junc = {i: i for i in range(len(coords))}
@@ -296,7 +337,7 @@ def merge_nearby_junctions(coords, edge_index, node_types, geometries, map_max, 
 
 
 def split_high_degree_junctions(
-    coords, edge_index, node_types, geometries, map_max, split_radius_m=3.0
+    coords, edge_index, node_types, geometries, map_size_m, split_radius_m=3.0
 ):
     """Split junction nodes with degree >= 5 into multiple degree-3/4 sub-nodes.
 
@@ -309,7 +350,7 @@ def split_high_degree_junctions(
         adj[int(u)].add(int(v))
         adj[int(v)].add(int(u))
 
-    split_rad = split_radius_m / map_max
+    split_rad = split_radius_m / map_size_m
     new_coords = list(coords)
     new_ei = list(edge_index)
     new_geoms = list(geometries)
@@ -363,7 +404,7 @@ def split_high_degree_junctions(
                 dir_mean = np.mean([a for a, _ in groups[g_idx]], axis=0)
                 offset = split_rad * np.array([np.cos(dir_mean), np.sin(dir_mean)])
                 sub_idx = len(new_coords)
-                new_coords.append(new_coords[n] + offset)
+                new_coords.append(np.asarray(new_coords[n]) + offset)
                 new_nt.append(1)
                 sub_nodes.append(sub_idx)
 
@@ -384,7 +425,7 @@ def split_high_degree_junctions(
             print(f"  [SplitJunc] Node {n} ({n_edges} arms) -> " f"{len(groups)} sub-junctions")
 
     return (
-        np.array(new_coords),
+        np.asarray(new_coords, dtype=np.float64),
         np.array(new_ei, dtype=np.int64),
         np.array(new_nt, dtype=np.int64),
         new_geoms,
@@ -394,7 +435,7 @@ def split_high_degree_junctions(
 # ── Merge inter-edge parallel roads ──────────────────────────────
 
 
-def merge_parallel_edges(coords, edge_index, geometries, map_max, angle_deg=30.0, dist_m=40.0):
+def merge_parallel_edges(coords, edge_index, geometries, map_size_m, angle_deg=30.0, dist_m=40.0):
     """Remove edges that are geometrically parallel and close.
 
     Unlike clean_parallel_roads which only checks edges sharing
@@ -402,8 +443,15 @@ def merge_parallel_edges(coords, edge_index, geometries, map_max, angle_deg=30.0
     """
     if len(edge_index) < 3:
         return coords, edge_index, geometries
-
-    from shapely.geometry import LineString
+    if isinstance(coords, np.ndarray):
+        if coords.ndim == 1:
+            coords = coords.reshape(-1, 2)
+    elif isinstance(coords, (list, tuple)):
+        if len(coords) > 0 and not isinstance(coords[0], (list, tuple, np.ndarray)):
+            # Flat list: [x0, y0, x1, y1, ...]
+            coords = np.array(coords, dtype=np.float64).reshape(-1, 2)
+        else:
+            coords = np.array(coords, dtype=np.float64)
 
     adj = {i: set() for i in range(len(coords))}
     for u, v in edge_index:
@@ -411,7 +459,7 @@ def merge_parallel_edges(coords, edge_index, geometries, map_max, angle_deg=30.0
         adj[int(v)].add(int(u))
 
     angle_rad = np.radians(angle_deg)
-    dist_norm = dist_m / map_max
+    dist_norm = dist_m / map_size_m
 
     to_remove = set()
     for i in range(len(edge_index)):
@@ -421,11 +469,11 @@ def merge_parallel_edges(coords, edge_index, geometries, map_max, angle_deg=30.0
         # Direction of edge i
         p1 = coords[u1]
         p2 = coords[v1]
-        d1 = p2 - p1
-        n1 = np.linalg.norm(d1)
+        d1 = np.atleast_1d(np.asarray(p2, dtype=np.float64) - np.asarray(p1, dtype=np.float64))
+        n1 = float(np.linalg.norm(d1))
         if n1 < 1e-12:
             continue
-        d1 /= n1
+        d1 = d1 / n1
 
         for j in range(i + 1, len(edge_index)):
             if j in to_remove:
@@ -441,31 +489,41 @@ def merge_parallel_edges(coords, edge_index, geometries, map_max, angle_deg=30.0
             # Angular check
             p3 = coords[u2]
             p4 = coords[v2]
-            d2 = p4 - p3
-            n2 = np.linalg.norm(d2)
+            d2 = np.atleast_1d(np.asarray(p4, dtype=np.float64) - np.asarray(p3, dtype=np.float64))
+            n2 = float(np.linalg.norm(d2))
             if n2 < 1e-12:
                 continue
-            d2 /= n2
-            dot = float(d1 @ d2)
+            d2 = d2 / n2
+            try:
+                dot = float(d1 @ d2)
+            except (ValueError, TypeError):
+                try:
+                    dot = float((d1 * d2).sum())
+                except (ValueError, TypeError):
+                    # Can't compute angle — assume parallel and check distance
+                    dot = 1.0
             angle = abs(np.arccos(np.clip(dot, -1, 1)))
             if angle > angle_rad and abs(angle - np.pi) > angle_rad:
                 continue
 
-            # Distance check: Hausdorff-like min distance between endpoints
-            ends1 = [coords[u1], coords[v1]]
-            ends2 = [coords[u2], coords[v2]]
-            min_dist = min(
-                np.linalg.norm(coords[u1] - coords[u2]),
-                np.linalg.norm(coords[u1] - coords[v2]),
-                np.linalg.norm(coords[v1] - coords[u2]),
-                np.linalg.norm(coords[v1] - coords[v2]),
+            # Distance check: true edge-to-edge distance (handles staggered overlaps)
+            _g1 = (
+                geometries[i]
+                if i < len(geometries) and len(geometries[i]) >= 2
+                else np.array([coords[u1], coords[v1]])
             )
+            _g2 = (
+                geometries[j]
+                if j < len(geometries) and len(geometries[j]) >= 2
+                else np.array([coords[u2], coords[v2]])
+            )
+            min_dist = LineString(_g1).distance(LineString(_g2))
             if min_dist > dist_norm:
                 continue
 
-            # Remove the longer edge
-            n1 = float(np.linalg.norm(p2 - p1))
-            n2 = float(np.linalg.norm(p4 - p3))
+            # Revert to length-based comparison for reliability
+            n1 = float(np.linalg.norm(coords[v1] - coords[u1]))
+            n2 = float(np.linalg.norm(coords[v2] - coords[u2]))
             to_remove.add(i if n1 >= n2 else j)
 
     if not to_remove:
@@ -476,7 +534,7 @@ def merge_parallel_edges(coords, edge_index, geometries, map_max, angle_deg=30.0
     keep_geoms = [geometries[j] for j in keep_idx]
 
     # Remove orphaned nodes
-    G = _build_nx(coords, keep_ei)
+    G = build_nx(coords, keep_ei)
     orphaned = [n for n in range(len(coords)) if G.degree(n) == 0]
     if orphaned:
         c = np.delete(coords, orphaned, axis=0)
@@ -491,30 +549,16 @@ def merge_parallel_edges(coords, edge_index, geometries, map_max, angle_deg=30.0
     return coords, keep_ei, keep_geoms
 
 
-def _build_nx(coords, edge_index):
-    """Build a networkx graph from coords + edge_index."""
-    import networkx as nx
-
-    G = nx.Graph()
-    for i, p in enumerate(coords):
-        G.add_node(i, pos=p.copy())
-    for u, v in edge_index:
-        G.add_edge(int(u), int(v))
-    return G
-
-
 # ── Snap edges to nearby nodes ────────────────────────────────────
 
 
-def snap_edges_to_nodes(coords, edge_index, geometries, map_max, snap_dist_m=8.0):
+def snap_edges_to_nodes(coords, edge_index, geometries, map_size_m, snap_dist_m=8.0):
     """Split compressed edges where they pass close to non-adjacent nodes.
 
     When an edge geometry passes within *snap_dist_m* of a node that is
     *not* one of its endpoints, the edge is subdivided at the closest
     point and a new connecting edge is inserted, creating an intersection.
     """
-    from shapely.geometry import LineString, Point
-    from shapely.ops import nearest_points
 
     adj: dict[int, set[int]] = {i: set() for i in range(len(coords))}
     for u, v in edge_index:
@@ -524,7 +568,7 @@ def snap_edges_to_nodes(coords, edge_index, geometries, map_max, snap_dist_m=8.0
     split_edges: dict[int, list[tuple[float, int, np.ndarray]]] = {}
     # (edge_idx -> list of (frac_on_line, new_node_idx, split_position))
     new_nodes: list[np.ndarray] = []
-    snap_norm = snap_dist_m / map_max
+    snap_norm = snap_dist_m / map_size_m
 
     for j in range(len(edge_index)):
         u, v = int(edge_index[j, 0]), int(edge_index[j, 1])
@@ -682,430 +726,3 @@ def align_geometries_to_nodes(coords, edge_index, geometries):
     if changes:
         print(f"[AlignGeom] {changes}/{len(edge_index)} geometries fixed")
     return geometries
-
-
-# ── Phase 1: Skeleton ──────────────────────────────────────────────
-
-
-def generate_skeleton(
-    gen: Any,
-    condition: torch.Tensor,
-    structural_priors: torch.Tensor,
-    *,
-    map_w: float = 2000.0,
-    map_h: float = 2000.0,
-    vq_map_size_m: float = 2000.0,
-    min_spacing_m: float = 80.0,
-    anchor_ratio: float = 0.08,
-    temperature: float = 0.75,
-    top_p: float = 0.65,
-    seed: int | None = None,
-) -> dict:
-    """Generate and clean a skeleton graph from VQ + Transformer.
-
-    Returns
-    -------
-    dict with keys ``coords``, ``edge_index``, ``road_field``, ``map_max``,
-    ``gridness``, ``organic``, ``density``, ``condition``.
-    """
-    density = float(structural_priors[0]) if structural_priors.dim() > 0 else 20.0
-    gridness = float(structural_priors[1]) if structural_priors.numel() > 1 else 0.5
-    organic = float(structural_priors[3]) if structural_priors.numel() > 3 else 0.5
-    map_max = max(map_w, map_h)
-
-    with torch.no_grad():
-        raw = gen.generate(
-            condition.unsqueeze(0) if condition.dim() == 1 else condition,
-            anchor_ratio=anchor_ratio,
-            temperature=temperature,
-            top_p=top_p,
-            seed=seed,
-        )
-    field = raw["road_field"]
-    coords_n = raw["coords"].copy()  # normalized [0, 1] in VQ space
-    ei = raw["edge_index"].copy()
-
-    if len(coords_n) < 5:
-        raise ValueError(f"Skeleton too small ({len(coords_n)} nodes)")
-
-    # Endpoint connector (VQ native size)
-    try:
-        conn = EndpointConnector(map_size_m=vq_map_size_m).run(
-            raw,
-            field,
-            max_connections=30,
-            connect_remaining=True,
-            max_remaining_m=600,
-            simplify=False,
-        )
-        coords_n = conn["coords"]
-        ei = conn["edge_index"]
-    except Exception:
-        pass
-
-    # Simplify chains
-    try:
-        simp = simplify_chains(coords_n, ei, angle_threshold_deg=15, dp_epsilon_norm=0.002)
-        coords_n, ei = simp[0], simp[1]
-    except Exception:
-        pass
-
-    # Scale to target map size
-    sx, sy = map_w / vq_map_size_m, map_h / vq_map_size_m
-    coords_n = coords_n * np.array([sx, sy])
-
-    # Spacing cleanup
-    merge_dist = max(0.005, min_spacing_m / map_max * 0.25)
-    merged = merge_close_nodes(
-        coords_n,
-        ei,
-        np.zeros(len(coords_n), dtype=np.int64),
-        merge_dist=merge_dist,
-        map_size_m=map_max,
-    )
-    coords_n, ei = merged[0], merged[1]
-
-    return {
-        "coords": coords_n,
-        "edge_index": ei,
-        "road_field": field,
-        "map_max": map_max,
-        "density": density,
-        "gridness": gridness,
-        "organic": organic,
-        "condition": condition,
-    }
-
-
-# ── Phase 2: Branch ────────────────────────────────────────────────
-
-
-def generate_branch(
-    coords: np.ndarray,
-    edge_index: np.ndarray,
-    road_field: np.ndarray,
-    condition: torch.Tensor,
-    *,
-    map_w: float = 2000.0,
-    map_h: float = 2000.0,
-    density: float = 20.0,
-    gridness: float = 0.5,
-    organic: float = 0.5,
-    local_spacing_m: float = 80.0,
-    g1_branch_p: float = 0.04,
-    grid_cuts: int = 15,
-    organic_cuts: int = 20,
-    prune_chain_m: float = 120.0,
-    snap_dist_m: float = 50.0,
-    angle_clean_deg: float = 15.0,
-    angle_clean_compressed_deg: float = 20.0,
-    parallel_angle_deg: float = 30.0,
-    parallel_dist_m: float = 40.0,
-    merge_junction_dist_m: float = 50.0,
-) -> dict:
-    """Grow collector roads (G1) and local roads (G2), then clean up.
-
-    Parameters
-    ----------
-    coords, edge_index :
-        Skeleton graph from ``generate_skeleton`` (normalised [0, 1] in map space).
-    road_field :
-        VQ road field (for A* endpoint closure).
-    condition :
-        11-dim style + structural condition tensor.
-    density, gridness, organic :
-        Structural priors (read from ``structural_priors`` if available).
-
-    Returns
-    -------
-    dict with keys ``coords_int``, ``edge_index_int``, ``node_types``,
-    ``lanes_per_dir``, ``geometries``, ``road_class``.
-    """
-    map_max = max(map_w, map_h)
-
-    # ── Growth ─────────────────────────────────────────────────────
-    gc = GrowthConfig.from_condition(
-        condition.cpu().numpy() if condition.dim() > 0 else np.zeros(11),
-        local_spacing_m=local_spacing_m,
-        map_size_m=map_max,
-    )
-    gc.map_width_m = map_w
-    gc.map_height_m = map_h
-
-    # Style-aware G2 overrides
-    if gridness > 0.6:
-        gc.g2_max_cuts_per_pass = max(gc.g2_max_cuts_per_pass, grid_cuts)
-        gc.g2_jitter_deg = 5.0
-        gc.g1_seed_jitter = 0.15
-        gc.per_step_jitter_deg = 2.0
-    elif organic > 0.6:
-        gc.g2_max_cuts_per_pass = max(gc.g2_max_cuts_per_pass, organic_cuts)
-        gc.g2_jitter_deg = 35.0
-        gc.g1_seed_jitter = 0.35
-        gc.per_step_jitter_deg = 8.0
-    gc.g1_branch_p = g1_branch_p
-
-    grown = grow(
-        coords * np.array([map_w, map_h]),
-        edge_index,
-        np.zeros(len(coords), dtype=np.int64),
-        road_field,
-        gc,
-    )
-    c_m = grown["coords"] / np.array([map_w, map_h])
-    ei = grown["edge_index"].copy()
-    rc = grown.get("road_class", np.ones(len(ei), dtype=np.int64))
-
-    # ── Merge close nodes in growth graph ─────────────────────────
-    _md = max(0.003, 30.0 / map_max)
-    _mrg = merge_close_nodes(
-        c_m, ei, np.zeros(len(c_m), dtype=np.int64), merge_dist=_md, map_size_m=map_max
-    )
-    c_m, ei = _mrg[0], _mrg[1]
-    # Fix edge crossings in growth graph
-    c_m, ei = _fix_growth_crossings(c_m, ei, map_max)
-
-    # ── Cleanup raw graph ──────────────────────────────────────────
-    c_m, ei = prune_dead_ends(c_m, ei, prune_chain_m, map_max)
-    c_m, ei = keep_lcc(c_m, ei)
-    c_m, ei = clean_sharp_angles(c_m, ei, min_deg=angle_clean_deg)
-    c_m, ei = snap_endpoints(c_m, ei, map_max, snap_dist_m=snap_dist_m)
-    c_m, ei = keep_lcc(c_m, ei)
-
-    # ── Compress to intersection graph ─────────────────────────────
-    c_int, ei_int, geoms = compress_to_intersection_graph(c_m, ei)
-
-    # ── Merge nearby compressed junctions ─────────────────────────
-    c_int, ei_int, geoms = merge_compressed_graph(c_int, ei_int, geoms, map_max, merge_dist_m=30.0)
-
-    # ── Snap edges to nearby non-adjacent nodes ────────────────────
-    # Creates intersections where roads pass close but don't share a node
-    c_int, ei_int, geoms = snap_edges_to_nodes(c_int, ei_int, geoms, map_max, snap_dist_m=8.0)
-
-    # ── Cleanup compressed graph ───────────────────────────────────
-    # Fix self-intersecting / abnormal geometries
-    fix_abnormal_edges(c_int, ei_int, geoms, map_max)
-    # Fix geometric crossings
-    c_int, ei_int, geoms = fix_edge_crossings(c_int, ei_int, geoms, map_max)
-    c_int, ei_int, geoms = clean_parallel_roads(
-        c_int, ei_int, geoms, map_max, angle_deg=parallel_angle_deg, max_dist_m=parallel_dist_m
-    )
-
-    # ── Inter-edge parallel road dedup (non-adjacent edges) ──────
-    c_int, ei_int, geoms = merge_parallel_edges(
-        c_int, ei_int, geoms, map_max, angle_deg=parallel_angle_deg, dist_m=parallel_dist_m
-    )
-
-    # ── Douglas-Peucker simplify edge geometries ──────────────────
-    # Remove micro-oscillations while preserving overall shape (~5m tolerance)
-    from shapely import simplify as dp_simplify
-    from shapely.geometry import LineString
-
-    dp_tol = 5.0 / map_max  # ~5m in normalised space
-    for j in range(len(geoms)):
-        if geoms[j] is not None and len(geoms[j]) >= 3:
-            ls = LineString(geoms[j])
-            simplified = dp_simplify(ls, tolerance=dp_tol)
-            if simplified.geom_type == "LineString" and len(simplified.coords) >= 2:
-                geoms[j] = np.array(simplified.coords)
-
-    # ── Classify ───────────────────────────────────────────────────
-    nt = classify_nodes(c_int, ei_int, map_max, merge_dist_m=merge_junction_dist_m, compressed=True)
-
-    # ── Physically merge nearby junction nodes ────────────────────
-    c_int, ei_int, nt, geoms = merge_nearby_junctions(
-        c_int, ei_int, nt, geoms, map_max, merge_dist_m=merge_junction_dist_m
-    )
-
-    # ── Split degree>=5 junctions into 3-4 arm sub-junctions ─────
-    c_int, ei_int, nt, geoms = split_high_degree_junctions(
-        c_int, ei_int, nt, geoms, map_max, split_radius_m=3.0
-    )
-
-    # ── Second parallel-road cleanup (after structural changes) ──
-    c_int, ei_int, geoms = clean_parallel_roads(
-        c_int, ei_int, geoms, map_max, angle_deg=parallel_angle_deg, max_dist_m=parallel_dist_m
-    )
-
-    # ── Re-align geometry endpoints to node positions ────────────
-    # Structural changes can leave geometry endpoints misaligned.
-    geoms = align_geometries_to_nodes(c_int, ei_int, geoms)
-
-    # ── Smooth compressed graph geometries ───────────────────────
-    # Removes micro-oscillations in edge polylines before offset.
-    from assemble_hdmap import _chaikin
-
-    geoms = [_chaikin(g, iterations=2) if len(g) >= 3 else g for g in geoms]
-
-    # ── Propagate road_class through compression ──────────────────
-    from collections import deque
-
-    growth_adj = {i: set() for i in range(len(c_m))}
-    for a, b in ei:
-        ia, ib = int(a), int(b)
-        growth_adj[ia].add(ib)
-        growth_adj[ib].add(ia)
-    growth_rc = {}
-    for ei_idx in range(len(ei)):
-        u, v = int(ei[ei_idx, 0]), int(ei[ei_idx, 1])
-        key = (u, v) if u < v else (v, u)
-        growth_rc[key] = int(rc[ei_idx]) if ei_idx < len(rc) else 1
-
-    def _trace_rc(start, end):
-        parent = {start: None}
-        q = deque([start])
-        while q:
-            cur = q.popleft()
-            if cur == end:
-                break
-            for nb in growth_adj[cur]:
-                if nb not in parent:
-                    parent[nb] = cur
-                    q.append(nb)
-        cur, prev = end, None
-        max_rc = 1
-        while cur is not None:
-            if prev is not None:
-                key = (cur, prev) if cur < prev else (prev, cur)
-                max_rc = max(max_rc, growth_rc.get(key, 1))
-            prev, cur = cur, parent.get(cur)
-        return max_rc
-
-    rc_int = np.ones(len(ei_int), dtype=np.int64)
-    for j in range(len(ei_int)):
-        u, v = int(ei_int[j, 0]), int(ei_int[j, 1])
-        rc_int[j] = _trace_rc(u, v)
-
-    # ── Lane assignment ────────────────────────────────────────────
-    # Factors: road_class, edge length, endpoint degree, density
-    import networkx as nx
-
-    G_lanes = nx.Graph()
-    for i in range(len(c_int)):
-        G_lanes.add_node(i)
-    for u, v in ei_int:
-        G_lanes.add_edge(int(u), int(v))
-
-    lanes = np.ones(len(ei_int), dtype=np.int64)
-    for j in range(len(ei_int)):
-        cls = int(rc_int[j])
-        u, v = int(ei_int[j, 0]), int(ei_int[j, 1])
-
-        # Edge length (metres)
-        if j < len(geoms) and len(geoms[j]) >= 2:
-            pts = np.asarray(geoms[j]) * map_max
-        else:
-            pts = np.array([c_int[u] * map_max, c_int[v] * map_max])
-        edge_len = sum(np.linalg.norm(pts[k + 1] - pts[k]) for k in range(len(pts) - 1))
-
-        # Node importance = sum of degrees of both endpoints
-        imp = G_lanes.degree(u) + G_lanes.degree(v)
-
-        # Base from road class
-        base = {1: 3, 2: 2, 3: 1}.get(cls, 1)
-
-        # Length adjustment
-        if edge_len > 400:
-            base += 1
-        elif edge_len < 80:
-            base -= 1
-
-        # Node importance adjustment (major junctions → more lanes)
-        if imp >= 8:
-            base += 1
-
-        # Density bonus
-        if density > 25 and base < 3:
-            base += 1
-
-        lanes[j] = max(1, min(4, base))
-
-    return {
-        "coords_int": c_int,
-        "edge_index_int": ei_int,
-        "node_types": nt,
-        "lanes_per_dir": lanes,
-        "geometries": geoms,
-        "road_class": rc_int,
-    }
-
-
-# ── Public lane assignment ───────────────────────────────────────
-
-
-def assign_lanes(
-    coords_int: np.ndarray,
-    edge_index_int: np.ndarray,
-    geometries: list[np.ndarray],
-    road_class: np.ndarray,
-    density: float = 20.0,
-) -> np.ndarray:
-    """Assign per-direction lane counts (1-4) to each compressed edge.
-
-    Factors: road_class, edge length (in metres), node importance, density.
-    Looking at generate_branch for the authoritative in-pipeline version.
-    """
-    import networkx as nx
-
-    G = nx.Graph()
-    for i in range(len(coords_int)):
-        G.add_node(i)
-    for u, v in edge_index_int:
-        G.add_edge(int(u), int(v))
-
-    lanes = np.ones(len(edge_index_int), dtype=np.int64)
-    for j in range(len(edge_index_int)):
-        cls = int(road_class[j])
-        u, v = int(edge_index_int[j, 0]), int(edge_index_int[j, 1])
-
-        if j < len(geometries) and len(geometries[j]) >= 2:
-            pts = np.asarray(geometries[j])
-        else:
-            pts = np.array([coords_int[u], coords_int[v]])
-        edge_len = sum(np.linalg.norm(pts[k + 1] - pts[k]) for k in range(len(pts) - 1))
-
-        imp = G.degree(u) + G.degree(v)
-        base = {1: 3, 2: 2, 3: 1}.get(cls, 1)
-        if edge_len > 400:
-            base += 1
-        elif edge_len < 80:
-            base -= 1
-        if imp >= 8:
-            base += 1
-        if density > 25 and base < 3:
-            base += 1
-        lanes[j] = max(1, min(4, base))
-    return lanes
-
-
-# ── Combined ───────────────────────────────────────────────────────
-
-
-def generate_full(
-    gen,
-    condition: torch.Tensor,
-    structural_priors: torch.Tensor,
-    *,
-    map_w: float = 2000.0,
-    map_h: float = 2000.0,
-    **kwargs,
-) -> dict:
-    """Run both phases: skeleton → branch, return merged result."""
-    skel = generate_skeleton(gen, condition, structural_priors, map_w=map_w, map_h=map_h, **kwargs)
-    branch = generate_branch(
-        skel["coords"],
-        skel["edge_index"],
-        skel["road_field"],
-        skel["condition"],
-        map_w=map_w,
-        map_h=map_h,
-        density=skel["density"],
-        gridness=skel["gridness"],
-        organic=skel["organic"],
-        **{
-            k: v
-            for k, v in kwargs.items()
-            if k not in ("anchor_ratio", "temperature", "top_p", "vq_map_size_m", "min_spacing_m")
-        },
-    )
-    return {**skel, **branch}

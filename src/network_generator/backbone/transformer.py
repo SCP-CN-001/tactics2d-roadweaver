@@ -1,11 +1,4 @@
-"""
-Conditional masked Transformer for code map generation.
-
-Predicts masked code tokens given visible tokens and an 11-dim condition.
-Supports two condition injection modes:
-  - **additive** (default): condition → MLP → added to token embeddings.
-  - **AdaLN**: per-block adaptive layer norm modulation (shift + scale + gate).
-"""
+"""Conditional masked Transformer for code maps."""
 
 from __future__ import annotations
 

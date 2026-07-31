@@ -1,9 +1,4 @@
-"""
-VQ-VAE: road field ↔ discrete code map.
-
-Encoder/decoder architecture is computed programmatically from
-resolution and code_map_size, eliminating redundant hardcoded branches.
-"""
+"""VQ-VAE road field quantisation."""
 
 from __future__ import annotations
 
@@ -30,6 +25,7 @@ class ResBlock(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply residual block with pre-activation."""
         return torch.relu_(x + self.net(x))
 
 
@@ -70,6 +66,7 @@ class VectorQuantizer(nn.Module):
         self.register_buffer("ema_w", self.embedding.weight.data.clone())
 
     def forward(self, z_e: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, dict]:
+        """Quantize encoder outputs via EMA codebook."""
         B, D, H, W = z_e.shape
         z_e_flat = z_e.permute(0, 2, 3, 1).reshape(-1, D)
         z_e_flat = z_e_flat.to(self.embedding.weight.dtype)
@@ -327,6 +324,7 @@ class VQVAE(nn.Module):
         return self.out_conv(torch.cat([feat, grid_feat], dim=1))
 
     def forward(self, field: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, dict]:
+        """Encode, quantize, and decode a road field."""
         z_e = self.encoder(field)
         with torch.amp.autocast("cuda", enabled=False):
             z_q, indices, info = self.quantizer(z_e.float())

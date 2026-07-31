@@ -1,12 +1,4 @@
-"""
-GraphTensorField — local direction field from H-Graph edge tangents.
-
-Constructs a queryable tensor field by sampling edge tangents from the
-H-Graph and propagating them via Gaussian-weighted neighbours.
-
-Each query returns (major_axis, minor_axis, anisotropy) at a given point,
-where major_axis is the dominant road direction and minor_axis is orthogonal.
-"""
+"""Graph tensor field from edge tangents."""
 
 from __future__ import annotations
 
@@ -18,6 +10,7 @@ from shapely.geometry import LineString
 
 
 def normalize(v: np.ndarray) -> np.ndarray:
+    """Normalize a vector to unit length."""
     nrm = np.linalg.norm(v)
     if nrm < 1e-9:
         return np.zeros_like(v)

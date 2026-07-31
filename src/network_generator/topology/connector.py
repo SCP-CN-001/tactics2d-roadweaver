@@ -1,16 +1,4 @@
-"""
-VX — Endpoint Connector (degree-1 only).
-
-Connects cross-component degree-1 endpoints on raw V10 pixel skeleton:
-
-  1. Find degree-1 endpoints, compute connected components
-  2. Score cross-component endpoint pairs (distance, direction, field)
-  3. A* on road field grid between best pairs (two-phase: guiding path → short segments)
-  4. Connect remaining small components (deg1 or closest-pair)
-  5. Chain-simplify + spatial merge → clean output graph
-
-This runs on RAW V10 skeleton (keep_all_nodes=True) for dense waypoints.
-"""
+"""Endpoint connector implementation."""
 
 from __future__ import annotations
 
@@ -18,13 +6,13 @@ from typing import Dict, List, Set, Tuple
 
 import numpy as np
 
-from network_generator.topology.graph_ops import (
+from network_generator.topology.graph_merge import merge_close_nodes
+from network_generator.topology.graph_simplify import simplify_chains as _simplify_chains_impl
+from network_generator.topology.graph_utils import (
     adjacency_from_edges,
     endpoint_nodes,
     find_components,
-    merge_close_nodes,
 )
-from network_generator.topology.graph_ops import simplify_chains as _simplify_chains_impl
 from network_generator.topology.pathfinding import (
     astar_connect_path,
     astar_grid,

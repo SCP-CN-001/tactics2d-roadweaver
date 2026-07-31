@@ -1,6 +1,4 @@
-"""
-Binary road field → skeleton graph extraction.
-"""
+"""Raster field to skeleton graph converter implementation."""
 
 from __future__ import annotations
 

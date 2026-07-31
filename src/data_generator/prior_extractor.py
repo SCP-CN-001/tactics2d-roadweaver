@@ -1,11 +1,4 @@
-"""
-Urban Structural Prior Extraction from OSM road networks.
-
-Computes all structural priors (global, skeleton graph, block) from a
-clipped OSM road network GeoDataFrame for a 2 km x 2 km urban patch.
-
-Public entry point: ``extract_all_priors()``.
-"""
+"""Urban structural prior extraction from OSM networks."""
 
 from __future__ import annotations
 
@@ -210,12 +203,14 @@ def compute_gridness_score(graph: nx.Graph, gdf) -> float:
 
 
 def _compute_dead_end_ratio(graph: nx.Graph) -> float:
+    """Compute the dead-end ratio of a graph."""
     if graph.number_of_nodes() == 0:
         return 0.0
     return sum(1 for _, d in graph.degree() if d == 1) / graph.number_of_nodes()
 
 
 def _compute_four_way_ratio(graph: nx.Graph) -> float:
+    """Compute the four-way intersection ratio."""
     intersections = [d for _, d in graph.degree() if d >= 3]
     if not intersections:
         return 0.0
@@ -328,6 +323,7 @@ def compute_organic_score(graph: nx.Graph, gdf, center_lat: float) -> float:
 
 
 def _compute_three_way_ratio(graph: nx.Graph) -> float:
+    """Compute the three-way intersection ratio."""
     intersections = [d for _, d in graph.degree() if d >= 3]
     if not intersections:
         return 0.0

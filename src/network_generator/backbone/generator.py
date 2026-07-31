@@ -1,9 +1,4 @@
-"""
-Generator — full pipeline entry point.
-
-Loads trained VQ-VAE + Transformer checkpoints, orchestrates
-anchor retrieval → masked completion → VQ decoding → field-to-graph.
-"""
+"""Backbone generation pipeline entry point."""
 
 from __future__ import annotations
 
@@ -18,6 +13,44 @@ from .config import CONFIG
 from .sampler import AnchorSampler
 from .transformer import MaskedCodeModel
 from .vq_vae import VQVAE
+
+
+def make_generator(
+    vq_checkpoint: str,
+    model_checkpoint: str,
+    *,
+    cache_path: str = "cache/masked_code_maps/train.npz",
+    device: str = "cuda",
+    num_codes: int = 512,
+    resolution: int = 128,
+    code_map_size: int = 32,
+    d_model: int = 256,
+    num_layers: int = 6,
+    nhead: int = 4,
+    use_adaln: bool = True,
+    cond_dim: int = 11,
+) -> Generator:
+    """Build a :class:`Generator` with the standard 2km style-checkpoint defaults.
+
+    Shared factory so scripts don't each repeat the same 12-line instantiation
+    block.  ``num_codes=512 / resolution=128 / code_map_size=32 / d_model=256 /
+    num_layers=6 / nhead=4 / use_adaln=True / cond_dim=11`` are the values used
+    by all current generation scripts; pass explicit overrides to change them.
+    """
+    return Generator(
+        vq_checkpoint=vq_checkpoint,
+        model_checkpoint=model_checkpoint,
+        cache_path=cache_path,
+        device=device,
+        num_codes=num_codes,
+        resolution=resolution,
+        code_map_size=code_map_size,
+        d_model=d_model,
+        num_layers=num_layers,
+        nhead=nhead,
+        use_adaln=use_adaln,
+        cond_dim=cond_dim,
+    )
 
 
 class Generator(nn.Module):

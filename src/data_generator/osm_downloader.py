@@ -1,9 +1,4 @@
-"""
-OSM road network downloader via Overpass API.
-
-Downloads OSM road networks for cities, with adaptive tiling for
-large areas and automatic retry on rate limits.
-"""
+"""OSM road network downloader via Overpass API."""
 
 from __future__ import annotations
 

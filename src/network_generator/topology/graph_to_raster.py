@@ -1,6 +1,4 @@
-"""
-Skeleton graph → multi-channel raster field.
-"""
+"""Skeleton graph to raster field converter implementation."""
 
 from __future__ import annotations
 

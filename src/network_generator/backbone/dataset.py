@@ -1,25 +1,15 @@
-"""
-Field dataset — renders GT skeleton graphs as raster field tensors.
-
-Each sample calls graph_to_raster() on the fly and returns:
-  - condition: style_vector, structural_priors, map_size
-  - field: (6, H, W) tensor:
-      [0] road_prob (binary centerline)
-      [1] sin_2theta, [2] cos_2theta
-      [3] junction_hm, [4] endpoint_hm
-      [5] soft_distance (auxiliary)
-
-Supports disk caching: if --cache-fields is enabled, rendered fields are
-saved to ``cache/dataset_fields/`` and loaded from there in subsequent runs.
-"""
+"""Skeleton field dataset and dataloader."""
 
 from __future__ import annotations
 
 import json
 import os
+from functools import partial
+from multiprocessing import Pool
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import torch
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
@@ -45,7 +35,6 @@ class SkeletonFieldDataset(Dataset):
     ):
         super().__init__()
         path = CONFIG.train_split_path if split == "train" else CONFIG.val_split_path
-        import pandas as pd
 
         self.df = pd.read_parquet(path)
         self.split = split
@@ -105,13 +94,12 @@ class SkeletonFieldDataset(Dataset):
         rows = []
         for idx in range(N):
             row = self.df.iloc[idx]
-            sv = [row[c] for c in self._style_cols] if has_style else [0.0] * CONFIG.style_dim
-            sp = [row[c] for c in self._structural_cols]
-            sg = row["skeleton_graph_json"]
-            rows.append((idx, sv, sp, sg))
-
-        from functools import partial
-        from multiprocessing import Pool
+            style_vec = (
+                [row[c] for c in self._style_cols] if has_style else [0.0] * CONFIG.style_dim
+            )
+            struct_priors = [row[c] for c in self._structural_cols]
+            skeleton_json = row["skeleton_graph_json"]
+            rows.append((idx, style_vec, struct_priors, skeleton_json))
 
         n_workers = min(os.cpu_count() or 4, 32)
         render_fn = partial(
@@ -235,8 +223,6 @@ def _render_one_field(args, resolution=256, style_dim=6, map_size_scale=5000.0):
         np.array(edge_list, dtype=np.int64) if edge_list else np.zeros((0, 2), dtype=np.int64)
     )
 
-    from network_generator.topology.graph_to_raster import graph_to_raster
-
     field = graph_to_raster(coords, edge_index, resolution=resolution, binary_centerline=True)
     fld = np.stack(
         [
@@ -272,6 +258,7 @@ def make_field_dataloader(
     resolution: int | None = None,
     cache_fields: bool = True,
 ) -> DataLoader:
+    """Build a DataLoader over skeleton field samples."""
     dataset = SkeletonFieldDataset(
         split=split, limit_samples=limit_samples, resolution=resolution, cache_fields=cache_fields
     )

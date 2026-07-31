@@ -1,8 +1,4 @@
-"""
-GrowthConfig — scale-aware configuration for paper-style road growth.
-
-All distance parameters are in **metres**.
-"""
+"""Scale-aware growth configuration parameters."""
 
 from __future__ import annotations
 
@@ -204,3 +200,25 @@ class GrowthConfig:
             if hasattr(cfg, k):
                 setattr(cfg, k, v)
         return cfg
+
+    def apply_style_overrides(
+        self,
+        *,
+        gridness: float = 0.5,
+        organic: float = 0.5,
+        grid_cuts: int = 15,
+        organic_cuts: int = 20,
+        g1_branch_p: float = 0.04,
+    ) -> None:
+        """Apply gridness/organic-aware G2 and branch overrides in place."""
+        if gridness > 0.6:
+            self.g2_max_cuts_per_pass = max(self.g2_max_cuts_per_pass, grid_cuts)
+            self.g2_jitter_deg = 5.0
+            self.g1_seed_jitter = 0.15
+            self.per_step_jitter_deg = 2.0
+        elif organic > 0.6:
+            self.g2_max_cuts_per_pass = max(self.g2_max_cuts_per_pass, organic_cuts)
+            self.g2_jitter_deg = 35.0
+            self.g1_seed_jitter = 0.35
+            self.per_step_jitter_deg = 8.0
+        self.g1_branch_p = g1_branch_p

@@ -1,12 +1,8 @@
-"""
-Convert RoadWeaver compressed graph → Tactics2D ``Map`` (Lanelet2-style HD map).
-
-Uses tactics2d modules for intersection / roundabout geometry.
-Road lanes are smoothed via clamped BSpline then offset per-point.
-"""
+"""Compressed graph to HD Map converter."""
 
 from __future__ import annotations
 
+import networkx as nx
 import numpy as np
 from shapely import is_empty
 from shapely.geometry import LineString, Polygon
@@ -14,151 +10,80 @@ from shapely.geometry import LineString, Polygon
 from tactics2d.map.element import Lane, LaneRelationship, Map
 from tactics2d.map.generator.road_segment.intersection import Intersection
 from tactics2d.map.generator.road_segment.roundabout import Roundabout
+from utils.geometry import segment_intersection as _segment_intersection
+
+from .geometry import (
+    chaikin,
+    cut_at_self_intersection,
+    geom,
+    heading,
+    offset,
+    offset_per_point,
+    smooth,
+)
 
 LANE_WIDTH_M = 3.5
 _SPEED_BY_RC = {1: 80, 2: 60, 3: 50}
 _INTERSECTION_RADIUS = 5.0
 
 
-# ---------------------------------------------------------------------------
-#  Helpers
-# ---------------------------------------------------------------------------
+def assign_lanes(
+    coords_int: np.ndarray,
+    edge_index_int: np.ndarray,
+    geometries: list[np.ndarray],
+    road_class: np.ndarray,
+    density: float = 20.0,
+) -> np.ndarray:
+    """Assign per-direction lane counts (1-4) to each compressed edge.
 
-
-def _heading(pts: np.ndarray, at_end: bool = False) -> float:
-    if len(pts) < 2:
-        return 0.0
-    d = pts[-1] - pts[-2] if at_end else pts[1] - pts[0]
-    return float(np.arctan2(d[1], d[0]))
-
-
-def _chaikin(pts: np.ndarray, iterations: int = 2) -> np.ndarray:
-    """Chaikin corner-cutting subdivision.
-
-    Safer than Catmull-Rom: always stays within the convex hull of the
-    control points and never self-intersects.  2 iterations ≈ smooth curve.
-    O(n) per iteration.
+    Factors: road_class, edge length (in metres), node importance, density.
     """
-    if len(pts) < 3:
-        return pts
-    for _ in range(iterations):
-        if len(pts) < 2:
-            break
-        nxt = [pts[0]]
-        for i in range(len(pts) - 1):
-            a, b = pts[i], pts[i + 1]
-            nxt.append(a + 0.25 * (b - a))
-            nxt.append(a + 0.75 * (b - a))
-        nxt.append(pts[-1])
-        pts = np.array(nxt)
-    return pts
+    G = nx.Graph()
+    for i in range(len(coords_int)):
+        G.add_node(i)
+    for u, v in edge_index_int:
+        G.add_edge(int(u), int(v))
 
+    lanes = np.ones(len(edge_index_int), dtype=np.int64)
+    for j in range(len(edge_index_int)):
+        cls = int(road_class[j])
+        u, v = int(edge_index_int[j, 0]), int(edge_index_int[j, 1])
 
-def _smooth(pts):
-    if len(pts) < 3:
-        return pts
-    try:
-        return _chaikin(pts, iterations=2)
-    except Exception:
-        return pts
-
-
-def _offset(pts: np.ndarray, d: float) -> np.ndarray:
-    """Offset centreline using Shapely ``offset_curve``.
-
-    Shapely's implementation inserts circular arcs at tight corners
-    instead of sharp angles, producing far fewer self-intersecting
-    boundaries than the manual per-segment approach.
-    """
-    if len(pts) < 2:
-        return pts
-    from shapely.geometry import LineString as _LS
-
-    result = _LS(pts).offset_curve(d)
-    if result.geom_type == "LineString" and len(result.coords) >= 2:
-        return np.array(result.coords, dtype=np.float64)
-    return pts
-
-
-def _geom(e, geoms_m, c, ei):
-    if e < len(geoms_m) and len(geoms_m[e]) >= 2:
-        return np.asarray(geoms_m[e], dtype=np.float64)
-    u, v = int(ei[e, 0]), int(ei[e, 1])
-    return np.array([c[u], c[v]])
-
-
-# ---------------------------------------------------------------------------
-#  Self-intersection fix  (cut at crossing point)
-# ---------------------------------------------------------------------------
-
-
-def _segment_intersection(a, b, c, d):
-    """Return intersection point of segments ab and cd, or ``None``."""
-    x1, y1 = a
-    x2, y2 = b
-    x3, y3 = c
-    x4, y4 = d
-    denom = (x1 - x2) * (y3 - y4) - (y1 - y2) * (x3 - x4)
-    if abs(denom) < 1e-12:
-        return None
-    t = ((x1 - x3) * (y3 - y4) - (y1 - y3) * (x3 - x4)) / denom
-    u = -((x1 - x2) * (y1 - y3) - (y1 - y2) * (x1 - x3)) / denom
-    if 0 < t < 1 and 0 < u < 1:
-        return np.array([x1 + t * (x2 - x1), y1 + t * (y2 - y1)])
-    return None
-
-
-def _cut_at_self_intersection(coords: np.ndarray) -> np.ndarray:
-    """Walk the polyline and truncate before the first crossing segment.
-
-    When a lane boundary self-intersects (a small loop at a tight corner),
-    this function removes the loop by cutting off everything from the
-    crossing segment onward.  The remaining clean portion is returned.
-    """
-    n = len(coords)
-    if n < 4:
-        return coords
-    for i in range(1, n - 2):
-        p1, p2 = coords[i], coords[i + 1]
-        for j in range(0, i - 1):
-            q1, q2 = coords[j], coords[j + 1]
-            if _segment_intersection(p1, p2, q1, q2) is not None:
-                return coords[: i + 1]
-    return coords
-
-
-def _offset_per_point(pts: np.ndarray, d: float) -> np.ndarray:
-    """Per-point perpendicular offset — simple, never self-intersects.
-
-    Offsets each point by *d* along the local perpendicular direction
-    (averaged from neighbouring segments for interior points).  The
-    result has sharp corners where the centreline turns, but those are
-    smoothed by the subsequent Chaikin pass.  Used as a fallback when
-    ``_offset`` (Shapely) produces a self-intersection that cannot be
-    cleanly cut.
-    """
-    n = len(pts)
-    if n < 2:
-        return pts
-    out = np.empty_like(pts)
-    for i in range(n):
-        if i == 0:
-            dx, dy = pts[1, 0] - pts[0, 0], pts[1, 1] - pts[0, 1]
-        elif i == n - 1:
-            dx, dy = pts[-1, 0] - pts[-2, 0], pts[-1, 1] - pts[-2, 1]
+        if j < len(geometries) and len(geometries[j]) >= 2:
+            pts = np.asarray(geometries[j])
         else:
-            dx, dy = pts[i + 1, 0] - pts[i - 1, 0], pts[i + 1, 1] - pts[i - 1, 1]
-        nrm = np.sqrt(dx * dx + dy * dy)
-        if nrm < 1e-12:
-            out[i] = pts[i]
-        else:
-            out[i] = pts[i] + np.array([-dy / nrm, dx / nrm]) * d
-    return out
+            pts = np.array([coords_int[u], coords_int[v]])
+        edge_len = sum(np.linalg.norm(pts[k + 1] - pts[k]) for k in range(len(pts) - 1))
 
+        imp = G.degree(u) + G.degree(v)
+        base = {1: 3, 2: 2, 3: 1}.get(cls, 1)
+        if edge_len > 400:
+            base += 1
+        elif edge_len < 80:
+            base -= 1
+        if imp >= 8:
+            base += 1
+        if density > 25 and base < 3:
+            base += 1
+        lanes[j] = max(1, min(4, base))
 
-# ---------------------------------------------------------------------------
-#  Main
-# ---------------------------------------------------------------------------
+    # Smooth lane counts: adjacent edges should differ by at most 1
+    # Build edge adjacency per node
+    node_edges: dict[int, list[int]] = {}
+    for j in range(len(edge_index_int)):
+        u, v = int(edge_index_int[j, 0]), int(edge_index_int[j, 1])
+        node_edges.setdefault(u, []).append(j)
+        node_edges.setdefault(v, []).append(j)
+    for _ in range(3):  # multiple passes for propagation
+        for n, e_list in node_edges.items():
+            if len(e_list) < 2:
+                continue
+            n_lanes = [lanes[e] for e in e_list]
+            avg = sum(n_lanes) // len(n_lanes)
+            for e in e_list:
+                if abs(lanes[e] - avg) > 1:
+                    lanes[e] = avg + (1 if lanes[e] > avg else -1)
+    return lanes
 
 
 def graph_to_map(
@@ -174,17 +99,18 @@ def graph_to_map(
     name="roadweaver",
     scenario_type="urban",
 ) -> Map:
+    """Build a Tactics2D Map from a compressed graph."""
     c = np.asarray(coords_int, dtype=np.float64) * np.array([map_w, map_h])
     ei = np.asarray(edge_index_int, dtype=np.int64)
-    E = len(ei)
-    if lanes_per_dir is None or len(lanes_per_dir) != E:
-        lanes_per_dir = np.full(E, 2, dtype=np.int64)
-    if road_class is None or len(road_class) != E:
-        road_class = np.full(E, 2, dtype=np.int64)
+    n_edges = len(ei)
+    if lanes_per_dir is None or len(lanes_per_dir) != n_edges:
+        lanes_per_dir = np.full(n_edges, 2, dtype=np.int64)
+    if road_class is None or len(road_class) != n_edges:
+        road_class = np.full(n_edges, 2, dtype=np.int64)
     if node_types is None:
         node_types = np.zeros(len(c), dtype=np.int64)
 
-    print(f"[Map] {E} edges  area={map_w:.0f}x{map_h:.0f}m")
+    print(f"[Map] {n_edges} edges  area={map_w:.0f}x{map_h:.0f}m")
 
     geoms_m = [
         (np.asarray(g, dtype=np.float64) * np.array([map_w, map_h]) if len(g) >= 2 else g)
@@ -193,7 +119,7 @@ def graph_to_map(
 
     node_in: dict[int, list[int]] = {n: [] for n in range(len(c))}
     node_out: dict[int, list[int]] = {n: [] for n in range(len(c))}
-    for e in range(E):
+    for e in range(n_edges):
         u, v = int(ei[e, 0]), int(ei[e, 1])
         node_out[u].append(e)
         node_in[v].append(e)
@@ -208,7 +134,7 @@ def graph_to_map(
     # Edges where BOTH ends are junction/RA (roundabout ring edges) are
     # internal to the junction and must NOT be truncated.
     geoms_road = list(geoms_m)
-    for e in range(E):
+    for e in range(n_edges):
         pts = geoms_road[e]
         if len(pts) < 2:
             continue
@@ -229,7 +155,7 @@ def graph_to_map(
         # Approaching v (edge ends at junction v)
         if v_is_junc:
             centre = c[v]
-            h = _heading(pts, at_end=True) + np.pi  # inward
+            h = heading(pts, at_end=True) + np.pi  # inward
             arm_pt = centre + _INTERSECTION_RADIUS * np.array(
                 [np.cos(h + np.pi), np.sin(h + np.pi)]
             )
@@ -246,7 +172,7 @@ def graph_to_map(
         pts = geoms_road[e]
         if len(pts) >= 2 and u_is_junc:
             centre = c[u]
-            h = _heading(pts, at_end=False)  # outward
+            h = heading(pts, at_end=False)  # outward
             arm_pt = centre + _INTERSECTION_RADIUS * np.array([np.cos(h), np.sin(h)])
             for k in range(len(pts)):
                 if np.linalg.norm(pts[k] - centre) >= _INTERSECTION_RADIUS:
@@ -258,45 +184,45 @@ def graph_to_map(
                     break
 
     # ---- Build road lanes --------------------------------------------
-    for e in range(E):
+    for e in range(n_edges):
         u, v = int(ei[e, 0]), int(ei[e, 1])
         # Skip edges attached to a dead-end node
         if (u < len(node_types) and int(node_types[u]) == 4) or (
             v < len(node_types) and int(node_types[v]) == 4
         ):
             continue
-        n_l = max(1, int(lanes_per_dir[e]))
+        n_lanes = max(1, int(lanes_per_dir[e]))
         speed = _SPEED_BY_RC.get(int(road_class[e]) if e < len(road_class) else 2, 50)
         pts = geoms_road[e]
         if len(pts) < 2:
             continue
         # Smooth
-        pts = _smooth(pts)
+        pts = smooth(pts)
         if len(pts) < 2:
             continue
-        for i in range(n_l * 2):
-            off = (i - n_l + 0.5) * LANE_WIDTH_M
-            left = _offset(pts, off + LANE_WIDTH_M / 2)
-            right = _offset(pts, off - LANE_WIDTH_M / 2)
+        for i in range(n_lanes * 2):
+            off = (i - n_lanes + 0.5) * LANE_WIDTH_M
+            left = offset(pts, off + LANE_WIDTH_M / 2)
+            right = offset(pts, off - LANE_WIDTH_M / 2)
             # Smooth lane boundaries (2 iterations)
             if len(left) >= 3:
-                left = _chaikin(left, iterations=2)
+                left = chaikin(left, iterations=2)
             if len(right) >= 3:
-                right = _chaikin(right, iterations=2)
+                right = chaikin(right, iterations=2)
             # Fix self-intersecting boundaries by cutting at crossing point
             if len(left) >= 4 and not LineString(left).is_simple:
-                left = _cut_at_self_intersection(left)
+                left = cut_at_self_intersection(left)
             if len(right) >= 4 and not LineString(right).is_simple:
-                right = _cut_at_self_intersection(right)
+                right = cut_at_self_intersection(right)
             # Fallback: if cut leaves too few points, use per-point offset
             if len(left) < 3:
-                left = _offset_per_point(pts, off + LANE_WIDTH_M / 2)
+                left = offset_per_point(pts, off + LANE_WIDTH_M / 2)
                 if len(left) >= 3:
-                    left = _chaikin(left, iterations=2)
+                    left = chaikin(left, iterations=2)
             if len(right) < 3:
-                right = _offset_per_point(pts, off - LANE_WIDTH_M / 2)
+                right = offset_per_point(pts, off - LANE_WIDTH_M / 2)
                 if len(right) >= 3:
-                    right = _chaikin(right, iterations=2)
+                    right = chaikin(right, iterations=2)
             # Realign endpoints at junction nodes so port matching succeeds
             u_j = u < len(node_types) and int(node_types[u]) in (1, 3)
             v_j = v < len(node_types) and int(node_types[v]) in (1, 3)
@@ -324,10 +250,10 @@ def graph_to_map(
                     right[0] = pts[0] + _perp * _dr
             # Re-check self-intersection after endpoint realignment
             if len(left) >= 4 and not LineString(left).is_simple:
-                left = _cut_at_self_intersection(left)
+                left = cut_at_self_intersection(left)
             if len(right) >= 4 and not LineString(right).is_simple:
-                right = _cut_at_self_intersection(right)
-            forward = i < n_l
+                right = cut_at_self_intersection(right)
+            forward = i < n_lanes
             if not forward:
                 left = left[::-1]
                 right = right[::-1]
@@ -378,14 +304,15 @@ def graph_to_map(
     for g_idx, group in enumerate(ra_groups):
         centre = np.mean([c[n] for n in group], axis=0)
         arms: list[dict] = []
+        _ra_arm_edges: list[int] = []  # edge_id per arm, same order as arms
         for n in group:
             for e in node_in[n] + node_out[n]:
                 u, v = int(ei[e, 0]), int(ei[e, 1])
                 other = v if u == n else u
                 if other in ra_nodes:
                     continue
-                pts = _geom(e, geoms_road, c, ei)
-                n_l = int(lanes_per_dir[e])
+                pts = geom(e, geoms_road, c, ei)
+                n_lanes = int(lanes_per_dir[e])
                 # Heading toward group centre, not toward individual RA node
                 if e in node_in[n]:
                     ep = pts[-1]  # geometry endpoint near roundabout
@@ -396,13 +323,14 @@ def graph_to_map(
                 arms.append(
                     {
                         "heading": h,
-                        "lane_num": n_l,
+                        "lane_num": n_lanes,
                         "radius": _INTERSECTION_RADIUS,
                         "speed_limit": _SPEED_BY_RC.get(
                             int(road_class[e]) if e < len(road_class) else 2, 50
                         ),
                     }
                 )
+                _ra_arm_edges.append(e)
         if len(arms) >= 2:
             ra = Roundabout(
                 ring_radius=_INTERSECTION_RADIUS * 3,
@@ -422,29 +350,72 @@ def graph_to_map(
             id_counter = res.id_counter
             for pname, port in res.ports.items():
                 is_in = "in" in pname
+                arm_idx = int(pname.split("_")[1])
+                if arm_idx >= len(_ra_arm_edges):
+                    continue
+                edge_id = _ra_arm_edges[arm_idx]
+                n_lanes = int(lanes_per_dir[edge_id])
+
                 pt = np.asarray(port.point)
+                h_p = float(port.heading)
+                perp = np.array([-np.sin(h_p), np.cos(h_p)])
                 ra_ids = [f"ra_{lid}" for lid in port.lane_ids if f"ra_{lid}" in all_lanes]
                 if not ra_ids:
                     continue
-                for lid in list(all_lanes.keys()):
-                    if not lid.startswith("e"):
+
+                port_lanes = []
+                for rid in ra_ids:
+                    rln = all_lanes.get(rid)
+                    if rln is None:
+                        continue
+                    try:
+                        _idx = 0 if is_in else -1
+                        _lt = np.array(list(rln.left_side.coords)[_idx])
+                        _rt = np.array(list(rln.right_side.coords)[_idx])
+                        _mid = (_lt + _rt) / 2
+                        _lat = float(np.dot(_mid - pt, perp))
+                        port_lanes.append((rid, _lat, _lt, _rt))
+                    except Exception:
+                        continue
+                port_lanes.sort(key=lambda x: x[1])
+
+                candidates = []
+                _start = 0 if is_in else n_lanes
+                _end = n_lanes if is_in else 2 * n_lanes
+                for __idx in range(_start, _end):
+                    lid = f"e{edge_id}_l{__idx}"
+                    if lid not in all_lanes:
                         continue
                     try:
                         lane = all_lanes[lid]
-                        # Use centreline midpoint for roundabout port matching
-                        try:
-                            left_end = np.array(list(lane.left_side.coords)[-1 if is_in else 0])
-                            right_end = np.array(list(lane.right_side.coords)[-1 if is_in else 0])
-                            ep = (left_end + right_end) / 2
-                        except:
-                            ep = np.array(
-                                list((lane.right_side if is_in else lane.left_side).coords)[
-                                    -1 if is_in else 0
-                                ]
-                            )
-                        if np.linalg.norm(ep - pt) < 25.0:
-                            for rid in ra_ids:
-                                (_link if is_in else lambda a, b: _link(b, a))(lid, rid)
+                        _is_fwd = __idx < n_lanes
+                        _eidx = -1 if _is_fwd else 0
+                        le = np.array(list(lane.left_side.coords)[_eidx])
+                        re = np.array(list(lane.right_side.coords)[_eidx])
+                        ep = (le + re) / 2
+                        _lat = float(np.dot(ep - pt, perp))
+                        candidates.append((lid, _lat))
+                    except Exception:
+                        continue
+                candidates.sort(key=lambda x: x[1])
+
+                n_match = min(len(candidates), len(port_lanes))
+                for k in range(n_match):
+                    lid, _ = candidates[k]
+                    rid, _lat, _lt, _rt = port_lanes[k]
+                    (_link if is_in else lambda a, b: _link(b, a))(lid, rid)
+                    try:
+                        lane = all_lanes[lid]
+                        _left = np.array(list(lane.left_side.coords))
+                        _right = np.array(list(lane.right_side.coords))
+                        if is_in:
+                            _left[-1] = _lt.copy()
+                            _right[-1] = _rt.copy()
+                        else:
+                            _left[0] = _lt.copy()
+                            _right[0] = _rt.copy()
+                        lane.left_side = LineString(_left)
+                        lane.right_side = LineString(_right)
                     except Exception:
                         pass
 
@@ -456,23 +427,25 @@ def graph_to_map(
         centre = c[n]
 
         arms = []
+        _arm_edges = []  # edge_id per arm, same order as arms
         for e in node_in[n] + node_out[n]:
-            pts = _geom(e, geoms_road, c, ei)
+            pts = geom(e, geoms_road, c, ei)
             is_in = e in node_in[n]
-            h = _heading(pts, at_end=is_in) + (np.pi if is_in else 0)
-            n_l = int(lanes_per_dir[e])
+            h = heading(pts, at_end=is_in) + (np.pi if is_in else 0)
+            n_lanes = int(lanes_per_dir[e])
             arms.append(
                 {
                     "heading": h,
-                    "lane_num": n_l,
+                    "lane_num": n_lanes,
                     "radius": _INTERSECTION_RADIUS,
                     "speed_limit": _SPEED_BY_RC.get(
                         int(road_class[e]) if e < len(road_class) else 2, 50
                     ),
                 }
             )
+            _arm_edges.append(e)
 
-        if len(arms) >= 3:  # intersection — any degree-3+ junction
+        if len(arms) >= 3:
             try:
                 inter = Intersection(
                     lane_width=LANE_WIDTH_M, radius=_INTERSECTION_RADIUS, speed_limit=30.0
@@ -485,33 +458,83 @@ def graph_to_map(
                 for j in res.junctions:
                     all_junctions[f"J_{n}"] = j
                 id_counter = res.id_counter
+
                 for pname, port in res.ports.items():
                     is_in = pname.endswith("_in")
+                    arm_idx = int(pname.split("_")[1])
+                    if arm_idx >= len(_arm_edges):
+                        continue
+                    edge_id = _arm_edges[arm_idx]
+                    n_lanes = int(lanes_per_dir[edge_id])
+
                     pt = np.asarray(port.point)
+                    h_p = float(port.heading)
+                    perp = np.array([-np.sin(h_p), np.cos(h_p)])
                     int_ids = [f"int_{lid}" for lid in port.lane_ids if f"int_{lid}" in all_lanes]
                     if not int_ids:
                         continue
-                    for lid in list(all_lanes.keys()):
-                        if not lid.startswith("e"):
+
+                    # Collect port connector lane boundary positions at arm side
+                    port_lanes = []  # (iid, left_at_boundary, right_at_boundary)
+                    for iid in int_ids:
+                        iiln = all_lanes.get(iid)
+                        if iiln is None:
+                            continue
+                        try:
+                            _idx = 0 if is_in else -1
+                            _lt = np.array(list(iiln.left_side.coords)[_idx])
+                            _rt = np.array(list(iiln.right_side.coords)[_idx])
+                            _mid = (_lt + _rt) / 2
+                            _lat = float(np.dot(_mid - pt, perp))
+                            port_lanes.append((iid, _lat, _lt, _rt))
+                        except Exception:
+                            continue
+                    port_lanes.sort(key=lambda x: x[1])
+
+                    # Collect road lane boundary positions (only from this edge, right direction)
+                    candidates = []
+                    _start = (
+                        0 if is_in else n_lanes
+                    )  # forward=0..n_lanes-1, backward=n_lanes..2*n_lanes-1
+                    _end = n_lanes if is_in else 2 * n_lanes
+                    for _idx in range(_start, _end):
+                        lid = f"e{edge_id}_l{_idx}"
+                        if lid not in all_lanes:
                             continue
                         try:
                             lane = all_lanes[lid]
-                            # Use centerline midpoint (not lane boundary) for port matching
-                            try:
-                                left_end = np.array(list(lane.left_side.coords)[-1 if is_in else 0])
-                                right_end = np.array(
-                                    list(lane.right_side.coords)[-1 if is_in else 0]
-                                )
-                                ep = (left_end + right_end) / 2
-                            except:
-                                ep = np.array(
-                                    list((lane.right_side if is_in else lane.left_side).coords)[
-                                        -1 if is_in else 0
-                                    ]
-                                )
-                            if np.linalg.norm(ep - pt) < 6.0:
-                                for iid in int_ids:
-                                    (_link if is_in else lambda a, b: _link(b, a))(lid, iid)
+                            _is_fwd = _idx < n_lanes
+                            # forward: coords[-1] at junction v; backward: coords[0] at junction v (reversed)
+                            _eidx = -1 if _is_fwd else 0
+                            le = np.array(list(lane.left_side.coords)[_eidx])
+                            re = np.array(list(lane.right_side.coords)[_eidx])
+                            ep = (le + re) / 2
+                            _lat = float(np.dot(ep - pt, perp))
+                            candidates.append((lid, _lat))
+                        except Exception:
+                            continue
+                    candidates.sort(key=lambda x: x[1])
+
+                    # 1:1 match by lateral order
+                    n_match = min(len(candidates), len(port_lanes))
+                    for k in range(n_match):
+                        lid, _ = candidates[k]
+                        iid, _lat, _lt, _rt = port_lanes[k]
+                        (_link if is_in else lambda a, b: _link(b, a))(lid, iid)
+
+                        # Snap road lane boundary to port lane boundary
+                        try:
+                            lane = all_lanes[lid]
+                            _left = np.array(list(lane.left_side.coords))
+                            _right = np.array(list(lane.right_side.coords))
+                            if is_in:
+                                _left[-1] = _lt.copy()
+                                _right[-1] = _rt.copy()
+                            else:
+                                _left[0] = _lt.copy()
+                                _right[0] = _rt.copy()
+                            lane.left_side = LineString(_left)
+                            lane.right_side = LineString(_right)
                         except Exception:
                             pass
             except Exception as exc:
@@ -554,88 +577,3 @@ def graph_to_map(
         f"{len(all_areas)} area  {total_succ} succ  {dead} dead"
     )
     return hd_map
-
-
-# ---------------------------------------------------------------------------
-#  Persistence
-# ---------------------------------------------------------------------------
-
-
-def map_to_file(hd_map: Map, path: str):
-    import pickle
-
-    with open(path, "wb") as f:
-        pickle.dump(hd_map, f)
-    print(f"[Map] Saved → {path}")
-
-
-# ---------------------------------------------------------------------------
-#  Quick visualisation  (black / white)
-# ---------------------------------------------------------------------------
-
-
-def quick_vis(hd_map: Map, path: str, dpi: int = 300):
-    import matplotlib
-
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
-    fig, ax = plt.subplots(figsize=(20, 20))
-    lanes = list(hd_map.lanes.values())
-    print(f"[Vis] {len(lanes)} lanes")
-
-    road_lanes = [l for l in lanes if l.id_.startswith("e")]
-    ra_lanes = [l for l in lanes if l.id_.startswith("ra_")]
-
-    # Road lane boundaries (black)
-    for lane in road_lanes:
-        try:
-            for side in (lane.left_side, lane.right_side):
-                if side is not None and not is_empty(side):
-                    x, y = side.xy
-                    ax.plot(x, y, color="#222", lw=0.6, alpha=0.9)
-        except Exception:
-            pass
-
-    # Junction shapes (gray fill + border)
-    for junc in (hd_map.junctions or {}).values():
-        try:
-            shape = getattr(junc, "custom_tags", {}).get("shape", [])
-            if shape and len(shape) > 2:
-                xs, ys = zip(*shape)
-                ax.fill(xs, ys, alpha=0.25, color="#888")
-                ax.plot(xs + (xs[0],), ys + (ys[0],), color="#555", lw=1.5, alpha=0.7)
-        except Exception:
-            pass
-
-    # Roundabout areas + ring lanes
-    for area in (hd_map.areas or {}).values():
-        try:
-            if area.geometry and not is_empty(area.geometry):
-                x, y = area.geometry.exterior.xy
-                ax.fill(x, y, alpha=0.25, color="#aaa")
-        except Exception:
-            pass
-    for lane in ra_lanes:
-        try:
-            for side in (lane.left_side, lane.right_side):
-                if side is not None and not is_empty(side):
-                    x, y = side.xy
-                    ax.plot(x, y, color="#555", lw=0.5, alpha=0.6)
-        except Exception:
-            pass
-
-    dead = sum(1 for l in road_lanes if not l.successors)
-    ra_dead = sum(1 for l in ra_lanes if not l.successors)
-    nj = len(hd_map.junctions or {})
-    na = len(hd_map.areas or {})
-    ax.set_aspect("equal")
-    ax.set_title(
-        f"HD Map — {len(road_lanes)} road lanes  {nj} junc  {na} area  "
-        f"{dead} road dead  {ra_dead} ra dead",
-        fontsize=12,
-    )
-    fig.tight_layout()
-    fig.savefig(path, dpi=dpi, bbox_inches="tight")
-    plt.close(fig)
-    print(f"[Vis] Saved → {path}")

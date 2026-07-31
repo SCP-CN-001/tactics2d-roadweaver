@@ -1,8 +1,4 @@
-"""
-CRHD (Color Road Hierarchy Diagram) Generator.
-
-Renders colour-coded road hierarchy images from OSM road networks.
-"""
+"""CRHD image rendering from OSM networks."""
 
 from __future__ import annotations
 

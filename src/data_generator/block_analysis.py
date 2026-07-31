@@ -1,8 +1,4 @@
-"""
-Block (urban parcel) extraction from road networks.
-
-A block is a contiguous area enclosed by roads and/or the patch boundary.
-"""
+"""Urban block extraction from road networks."""
 
 from __future__ import annotations
 
