@@ -14,12 +14,12 @@ from utils.geometry import segment_intersection as _segment_intersection
 
 from .geometry import (
     chaikin,
-    cut_at_self_intersection,
     geom,
     heading,
-    offset,
     offset_per_point,
+    self_intersection_frac,
     smooth,
+    truncate_at_frac,
 )
 
 LANE_WIDTH_M = 3.5
@@ -84,6 +84,72 @@ def assign_lanes(
                 if abs(lanes[e] - avg) > 1:
                     lanes[e] = avg + (1 if lanes[e] > avg else -1)
     return lanes
+
+
+def _respace_approach_lanes(
+    all_lanes, geoms_road, ei, node_types, lanes_per_dir, node_in, node_out
+):
+    """Re-space multi-lane approach cross-sections at junctions to even W spacing.
+
+    The cross-section at each junction end is rebuilt from the road centreline
+    and a single lateral axis, so all approach lanes of a road share the same
+    inner/outer ordering at both ends (no hourglass twist / inner-outer swap).
+
+    ``perp`` is the left normal of the u->v direction.  Forward lanes (u->v)
+    sit on the +perp side with their LEFT outward; backward lanes (v->u) sit
+    on the -perp side with their LEFT outward too (driving direction flips).
+    The junction end of every approach lane is ``coords[-1]`` (a backward lane
+    is stored reversed, so it ends at u).
+    """
+    W = LANE_WIDTH_M
+    for e in range(len(ei)):
+        u, v = int(ei[e, 0]), int(ei[e, 1])
+        n_l = int(lanes_per_dir[e])
+        if n_l < 2:
+            continue
+        g = geoms_road[e]
+        if len(g) < 2:
+            continue
+        d = g[-1] - g[0]  # u->v direction
+        ln = float(np.linalg.norm(d))
+        if ln < 1e-9:
+            continue
+        perp = np.array([-d[1] / ln, d[0] / ln])  # left normal of u->v
+
+        for node, incoming, centreline_pt in (
+            (v, True, g[-1]),  # forward approach ends at v
+            (u, False, g[0]),  # backward approach ends at u
+        ):
+            if node >= len(node_types) or int(node_types[node]) != 1:
+                continue
+            if incoming and e not in node_in[node]:
+                continue
+            if not incoming and e not in node_out[node]:
+                continue
+            # Approach lanes INNER -> OUTER.
+            if incoming:
+                lane_idx = list(range(n_l - 1, -1, -1))  # [n-1, ..., 0]
+            else:
+                lane_idx = list(range(n_l, 2 * n_l))  # [n, ..., 2n-1]
+            for j, i in enumerate(lane_idx):
+                lid = f"e{e}_l{i}"
+                lane = all_lanes.get(lid)
+                if lane is None or lane.left_side is None or lane.right_side is None:
+                    break
+                if incoming:
+                    centre = centreline_pt - (j + 0.5) * W * perp
+                    left_pt = centre - 0.5 * W * perp
+                    right_pt = centre + 0.5 * W * perp
+                else:
+                    centre = centreline_pt + (j + 0.5) * W * perp
+                    left_pt = centre + 0.5 * W * perp
+                    right_pt = centre - 0.5 * W * perp
+                _l = np.array(list(lane.left_side.coords))
+                _r = np.array(list(lane.right_side.coords))
+                _l[-1] = left_pt
+                _r[-1] = right_pt
+                lane.left_side = LineString(_l)
+                lane.right_side = LineString(_r)
 
 
 def graph_to_map(
@@ -183,7 +249,28 @@ def graph_to_map(
                     geoms_road[e] = np.array(clipped)
                     break
 
-    # ---- Build road lanes --------------------------------------------
+    # ---- Build road lanes (shared-boundary computation) --------------
+    # For each edge we compute 2·n_lanes+1 unique offset curves ONCE, then
+    # build lanes by pairing adjacent boundaries.  This guarantees adjacent
+    # lanes share identical boundary LineStrings — no gaps, no overlaps.
+    #
+    # Boundary      Offset          Shared by lanes
+    # ─────────     ──────          ──────────────
+    # b[0]          -(n_l)*W        fwd[0].right
+    # b[1]          -(n_l-1)*W      fwd[0].left  = fwd[1].right
+    #  ...           ...             ...
+    # b[n_l-1]      -W              fwd[n_l-2].left = fwd[n_l-1].right
+    # b[n_l]         0 (centreline)  fwd[n_l-1].left = bwd[n_l].left
+    # b[n_l+1]      +W              bwd[n_l].right = bwd[n_l+1].left
+    #  ...           ...             ...
+    # b[2·n_l]      +n_l*W          bwd[2·n_l-1].right
+    #
+    # We save the shared boundary arrays in _edge_bounds so that port
+    # matching can modify them directly; after all modifications we call
+    # _rebuild_lane_linestrings() to recreate the Lane geometry from the
+    # (possibly modified) shared arrays.
+    _edge_bounds: dict[int, list[np.ndarray | None]] = {}
+
     for e in range(n_edges):
         u, v = int(ei[e, 0]), int(ei[e, 1])
         n_lanes = max(1, int(lanes_per_dir[e]))
@@ -195,68 +282,119 @@ def graph_to_map(
         pts = smooth(pts)
         if len(pts) < 2:
             continue
-        for i in range(n_lanes * 2):
-            off = (i - n_lanes + 0.5) * LANE_WIDTH_M
-            left = offset(pts, off + LANE_WIDTH_M / 2)
-            right = offset(pts, off - LANE_WIDTH_M / 2)
-            # Smooth lane boundaries (2 iterations)
-            if len(left) >= 3:
-                left = chaikin(left, iterations=2)
-            if len(right) >= 3:
-                right = chaikin(right, iterations=2)
-            # Fix self-intersecting boundaries by cutting at crossing point
-            if len(left) >= 4 and not LineString(left).is_simple:
-                left = cut_at_self_intersection(left)
-            if len(right) >= 4 and not LineString(right).is_simple:
-                right = cut_at_self_intersection(right)
-            # Fallback: if cut leaves too few points, use per-point offset
-            if len(left) < 3:
-                left = offset_per_point(pts, off + LANE_WIDTH_M / 2)
-                if len(left) >= 3:
-                    left = chaikin(left, iterations=2)
-            if len(right) < 3:
-                right = offset_per_point(pts, off - LANE_WIDTH_M / 2)
-                if len(right) >= 3:
-                    right = chaikin(right, iterations=2)
-            # Realign endpoints at junction nodes so port matching succeeds
-            u_j = u < len(node_types) and int(node_types[u]) in (1, 3)
-            v_j = v < len(node_types) and int(node_types[v]) in (1, 3)
-            if u_j and int(node_types[u]) == 3:
-                u_j = False
-            if v_j and int(node_types[v]) == 3:
-                v_j = False
-            if v_j and len(pts) >= 2 and len(left) >= 2 and len(right) >= 2:
+        # Drop consecutive (near-)duplicate points: offset_per_point leaves
+        # the boundary ON the centreline at zero-length segments, which makes
+        # the lane width collapse to 0 (the "hollow").
+        if len(pts) > 2:
+            _keep = [pts[0]]
+            for _p in pts[1:]:
+                if np.linalg.norm(_p - _keep[-1]) > 1e-7:
+                    _keep.append(_p)
+            pts = np.array(_keep)
+            if len(pts) < 2:
+                continue
+
+        # --- Compute all unique offset boundaries once -----------------
+        n_b = 2 * n_lanes + 1  # number of unique boundary curves
+        boundaries: list[np.ndarray | None] = [None] * n_b
+
+        for k in range(n_b):
+            d = (k - n_lanes) * LANE_WIDTH_M
+            b = offset_per_point(pts, d)
+            if len(b) < 2:
+                boundaries[k] = None
+                continue
+            boundaries[k] = b
+
+        # --- Find minimum self-intersection fraction across ALL boundaries
+        # All boundaries on the same edge must be truncated at the SAME arc
+        # position, otherwise boundaries that should be identical diverge and
+        # create gaps between adjacent lanes.
+        min_cut = 1.0
+        for k in range(n_b):
+            b = boundaries[k]
+            if b is None or len(b) < 4:
+                continue
+            if not LineString(b).is_simple:
+                _f = self_intersection_frac(b)
+                if _f is not None:
+                    min_cut = min(min_cut, _f)
+
+        if min_cut < 1.0:
+            for k in range(n_b):
+                if boundaries[k] is not None:
+                    boundaries[k] = truncate_at_frac(boundaries[k], min_cut)
+
+        # --- Fallback: if a boundary got too short, recompute ----------
+        for k in range(n_b):
+            if boundaries[k] is not None and len(boundaries[k]) < 3:
+                d = (k - n_lanes) * LANE_WIDTH_M
+                boundaries[k] = offset_per_point(pts, d)
+                if boundaries[k] is not None and len(boundaries[k]) >= 3:
+                    boundaries[k] = chaikin(boundaries[k], iterations=2)
+
+        # --- Realign endpoints perpendicular to centreline -------------
+        # Only the first and last point of each boundary is adjusted;
+        # interior points stay as offset_per_point produced them.
+        if len(pts) >= 2:
+            for k in range(n_b):
+                b = boundaries[k]
+                if b is None or len(b) < 2:
+                    continue
+                d = (k - n_lanes) * LANE_WIDTH_M
+                # End of centreline → boundary coords[-1]
                 _s = pts[-1] - pts[-2]
                 _sn = np.linalg.norm(_s)
                 if _sn > 1e-6:
                     _perp = np.array([-_s[1] / _sn, _s[0] / _sn])
-                    _dl = off + LANE_WIDTH_M / 2
-                    _dr = off - LANE_WIDTH_M / 2
-                    left[-1] = pts[-1] + _perp * _dl
-                    right[-1] = pts[-1] + _perp * _dr
-            if u_j and len(pts) >= 2 and len(left) >= 2 and len(right) >= 2:
+                    b[-1] = pts[-1] + _perp * d
+                # Start of centreline → boundary coords[0]
                 _s = pts[1] - pts[0]
                 _sn = np.linalg.norm(_s)
                 if _sn > 1e-6:
                     _perp = np.array([-_s[1] / _sn, _s[0] / _sn])
-                    _dl = off + LANE_WIDTH_M / 2
-                    _dr = off - LANE_WIDTH_M / 2
-                    left[0] = pts[0] + _perp * _dl
-                    right[0] = pts[0] + _perp * _dr
-            # Re-check self-intersection after endpoint realignment
-            if len(left) >= 4 and not LineString(left).is_simple:
-                left = cut_at_self_intersection(left)
-            if len(right) >= 4 and not LineString(right).is_simple:
-                right = cut_at_self_intersection(right)
+                    b[0] = pts[0] + _perp * d
+
+        # --- Re-check self-intersection after realignment --------------
+        min_cut2 = 1.0
+        for k in range(n_b):
+            b = boundaries[k]
+            if b is None or len(b) < 4:
+                continue
+            if not LineString(b).is_simple:
+                _f = self_intersection_frac(b)
+                if _f is not None:
+                    min_cut2 = min(min_cut2, _f)
+
+        if min_cut2 < 1.0:
+            for k in range(n_b):
+                if boundaries[k] is not None:
+                    boundaries[k] = truncate_at_frac(boundaries[k], min_cut2)
+
+        # Save shared boundaries for later modification by port matching
+        _edge_bounds[e] = boundaries
+
+        # --- Build lanes from shared boundaries ------------------------
+        for i in range(n_lanes * 2):
             forward = i < n_lanes
-            if not forward:
-                left = left[::-1]
-                right = right[::-1]
+            if forward:
+                # Forward lane i: left=b[i+1], right=b[i]
+                b_left = boundaries[i + 1] if i + 1 < n_b else None
+                b_right = boundaries[i] if i < n_b else None
+                left = b_left
+                right = b_right
+            else:
+                # Backward lane i: left=reversed(b[i]), right=reversed(b[i+1])
+                b_left = boundaries[i] if i < n_b else None
+                b_right = boundaries[i + 1] if i + 1 < n_b else None
+                left = b_left[::-1] if b_left is not None else None
+                right = b_right[::-1] if b_right is not None else None
+
             lid = f"e{e}_l{i}"
             all_lanes[lid] = Lane(
                 id_=lid,
-                left_side=LineString(left) if len(left) >= 2 else None,
-                right_side=LineString(right) if len(right) >= 2 else None,
+                left_side=LineString(left) if left is not None and len(left) >= 2 else None,
+                right_side=LineString(right) if right is not None and len(right) >= 2 else None,
                 subtype="road",
                 speed_limit=speed,
                 speed_limit_unit="km/h",
@@ -413,19 +551,9 @@ def graph_to_map(
                             lid, _ = candidates[k]
                             rid, _lat, _lt, _rt = port_lanes[k % n_conn]
                             _link(lid, rid)
-                        for k in range(min(len(candidates), n_conn)):
-                            lid, _ = candidates[k]
-                            _lt, _rt = port_lanes[k][2], port_lanes[k][3]
-                            try:
-                                lane = all_lanes[lid]
-                                _left = np.array(list(lane.left_side.coords))
-                                _right = np.array(list(lane.right_side.coords))
-                                _left[-1] = _lt.copy()
-                                _right[-1] = _rt.copy()
-                                lane.left_side = LineString(_left)
-                                lane.right_side = LineString(_right)
-                            except Exception:
-                                pass
+                        # NOTE: boundary snap removed.  The roundabout polygon
+                        # covers the junction area; shared-boundary lane
+                        # building already guarantees lane bodies are gap-free.
                 else:
                     # Depart: every connector ending at this arm gets the depart
                     # road as its successor (a road lane accepts traffic from
@@ -436,21 +564,6 @@ def graph_to_map(
                             rid, _lat, _lt, _rt = port_lanes[k]
                             lid, _ = candidates[k % n_depart]
                             _link(rid, lid)
-                        # Snap each depart lane's start once, from the laterally
-                        # best-matching connectors.
-                        for k in range(min(n_depart, len(port_lanes))):
-                            lid, _ = candidates[k]
-                            _lt, _rt = port_lanes[k][2], port_lanes[k][3]
-                            try:
-                                lane = all_lanes[lid]
-                                _left = np.array(list(lane.left_side.coords))
-                                _right = np.array(list(lane.right_side.coords))
-                                _left[0] = _lt.copy()
-                                _right[0] = _rt.copy()
-                                lane.left_side = LineString(_left)
-                                lane.right_side = LineString(_right)
-                            except Exception:
-                                pass
 
     # ---- Individual intersection nodes (non-RA) -----------------------
     for n in range(len(c)):
@@ -553,31 +666,30 @@ def graph_to_map(
                     candidates.sort(key=lambda x: x[1])
 
                     if is_in:
-                        # Approach: every approaching road lane gets a connector as
-                        # successor (a connector may accept several road lanes), so
-                        # no road lane is left dangling and successor chains do not
-                        # break at the junction.
-                        n_conn = len(port_lanes)
-                        if n_conn and candidates:
+                        # Approach: match road lanes to the STRAIGHT connectors
+                        # (which continue the road) first, so a through road does
+                        # not veer sideways into a turn lane near the junction.
+                        # Extra road lanes fall back to turn connectors.
+                        straight = [
+                            pl
+                            for pl in port_lanes
+                            if all_lanes[pl[0]].custom_tags.get("turn") == "straight"
+                        ]
+                        turns = [
+                            pl
+                            for pl in port_lanes
+                            if all_lanes[pl[0]].custom_tags.get("turn") != "straight"
+                        ]
+                        primary = straight if straight else port_lanes
+                        if primary and candidates:
                             for k in range(len(candidates)):
                                 lid, _ = candidates[k]
-                                iid, _lat, _lt, _rt = port_lanes[k % n_conn]
+                                iid = primary[k % len(primary)][0]
                                 _link(lid, iid)
-                            # Snap road lane junction ends from the laterally
-                            # best-matching connectors.
-                            for k in range(min(len(candidates), n_conn)):
-                                lid, _ = candidates[k]
-                                _lt, _rt = port_lanes[k][2], port_lanes[k][3]
-                                try:
-                                    lane = all_lanes[lid]
-                                    _left = np.array(list(lane.left_side.coords))
-                                    _right = np.array(list(lane.right_side.coords))
-                                    _left[-1] = _lt.copy()
-                                    _right[-1] = _rt.copy()
-                                    lane.left_side = LineString(_left)
-                                    lane.right_side = LineString(_right)
-                                except Exception:
-                                    pass
+                            # NOTE: centreline boundary snap removed.
+                            # Shared-boundary lane building guarantees forward
+                            # and backward innermost lanes share identical
+                            # centreline endpoints; no per-lane snap needed.
                     else:
                         # Depart: every connector ending at this arm gets the depart
                         # road as its successor (a road lane accepts traffic from
@@ -588,21 +700,6 @@ def graph_to_map(
                                 iid, _lat, _lt, _rt = port_lanes[k]
                                 lid, _ = candidates[k % n_depart]
                                 _link(iid, lid)
-                            # Snap each depart lane's start once, from the laterally
-                            # best-matching connectors.
-                            for k in range(min(n_depart, len(port_lanes))):
-                                lid, _ = candidates[k]
-                                _lt, _rt = port_lanes[k][2], port_lanes[k][3]
-                                try:
-                                    lane = all_lanes[lid]
-                                    _left = np.array(list(lane.left_side.coords))
-                                    _right = np.array(list(lane.right_side.coords))
-                                    _left[0] = _lt.copy()
-                                    _right[0] = _rt.copy()
-                                    lane.left_side = LineString(_left)
-                                    lane.right_side = LineString(_right)
-                                except Exception:
-                                    pass
             except Exception as exc:
                 print(f"  [Map] Intersection at node {n} failed: {exc}")
 
@@ -630,6 +727,14 @@ def graph_to_map(
                 lid_a = f"e{ea}_l{ia if ea_approach_fwd else ia + na}"
                 lid_b = f"e{eb}_l{ib if eb_depart_fwd else ib + nb}"
                 _link(lid_a, lid_b)
+
+    # ---- Re-space multi-lane approach cross-sections at junctions ----
+    # NOTE: _respace_approach_lanes is no longer needed.  Shared-boundary
+    # lane building (above) already guarantees constant W spacing and
+    # correct inner/outer ordering for both directions.  Calling it here
+    # would overwrite shared boundary endpoints with per-lane copies and
+    # create gaps between adjacent lanes.
+    # _respace_approach_lanes(all_lanes, geoms_road, ei, node_types, lanes_per_dir, node_in, node_out)
 
     # ---- Remove road lanes disconnected from the junction network ----
     # A road lane is kept only if it is reachable (via successor links) from

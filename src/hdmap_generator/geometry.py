@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 from shapely.geometry import LineString as _LineString
+from shapely.geometry import Point as _Point
 
 from utils.geometry import chaikin as _chaikin_keep_ends
 from utils.geometry import segment_intersection as _segment_intersection
@@ -28,11 +29,16 @@ def chaikin(pts: np.ndarray, iterations: int = 2) -> np.ndarray:
 
 
 def smooth(pts):
-    """Smooth a polyline with Chaikin subdivision."""
+    """Smooth a polyline with Chaikin subdivision.
+
+    4 iterations instead of 2: sharp kinks in compressed edge geometries
+    otherwise make ``offset_curve`` produce left/right boundaries that cross
+    (lane width → 0 — the "hollow" seen near roads).
+    """
     if len(pts) < 3:
         return pts
     try:
-        return chaikin(pts, iterations=2)
+        return chaikin(pts, iterations=4)
     except Exception:
         return pts
 
@@ -82,6 +88,81 @@ def cut_at_self_intersection(coords: np.ndarray) -> np.ndarray:
             q1, q2 = coords[j], coords[j + 1]
             if _segment_intersection(p1, p2, q1, q2) is not None:
                 return coords[: i + 1]
+    return coords
+
+
+def trim_offset_caps(boundary: np.ndarray, centerline: np.ndarray, d: float) -> np.ndarray:
+    """Remove the round cap arcs ``offset_curve`` adds at both ends.
+
+    ``offset_curve`` closes each end with a semicircular cap centred on the
+    centreline endpoint; the cap's interior points sit close to the centreline
+    and pinch the lane to zero width there (the "hollow" seen near roads).
+    Keep only the points that are at roughly the intended offset distance
+    from the centreline.
+    """
+    if len(boundary) < 3:
+        return boundary
+    ls = _LineString(centerline)
+    min_d = abs(d) * 0.85
+    start = 0
+    for k in range(len(boundary)):
+        if ls.distance(_Point(boundary[k])) >= min_d:
+            start = k
+            break
+    end = len(boundary)
+    for k in range(len(boundary) - 1, -1, -1):
+        if ls.distance(_Point(boundary[k])) >= min_d:
+            end = k + 1
+            break
+    if end - start < 2:
+        return boundary
+    return np.asarray(boundary[start:end])
+
+
+def self_intersection_frac(coords: np.ndarray) -> float | None:
+    """Return the arc-length fraction of the first self-intersection, or None.
+
+    Unlike :func:`cut_at_self_intersection` (which returns the truncated
+    polyline), this reports *where* the boundary crosses itself so that both
+    lane boundaries can be cut at the *same* arc position.  Cutting only one
+    boundary (as the old code did) leaves the lane width collapsing to a
+    narrow sliver from the cut point onward — the "hollow" seen near
+    intersections.
+    """
+    n = len(coords)
+    if n < 4:
+        return None
+    seg_len = np.sqrt(((coords[1:] - coords[:-1]) ** 2).sum(axis=1))
+    cum = np.concatenate([[0], np.cumsum(seg_len)])
+    total = float(cum[-1])
+    if total < 1e-12:
+        return None
+    for i in range(1, n - 2):
+        p1, p2 = coords[i], coords[i + 1]
+        for j in range(0, i - 1):
+            q1, q2 = coords[j], coords[j + 1]
+            if _segment_intersection(p1, p2, q1, q2) is not None:
+                return float(cum[i]) / total
+    return None
+
+
+def truncate_at_frac(coords: np.ndarray, frac: float) -> np.ndarray:
+    """Truncate a polyline at the given arc-length fraction."""
+    if frac <= 0.0:
+        return coords[:1]
+    if frac >= 1.0:
+        return coords
+    seg_len = np.sqrt(((coords[1:] - coords[:-1]) ** 2).sum(axis=1))
+    cum = np.concatenate([[0], np.cumsum(seg_len)])
+    total = float(cum[-1])
+    if total < 1e-12:
+        return coords
+    target = frac * total
+    for k in range(1, len(coords)):
+        if cum[k] >= target:
+            t = (target - cum[k - 1]) / (cum[k] - cum[k - 1] + 1e-12)
+            pt = coords[k - 1] + t * (coords[k] - coords[k - 1])
+            return np.vstack([coords[:k], [pt]])
     return coords
 
 

@@ -37,7 +37,6 @@ from network_generator.topology.graph_refine import (
     merge_nearby_junctions,
     merge_parallel_edges,
     snap_edges_to_nodes,
-    split_high_degree_junctions,
 )
 from network_generator.topology.graph_simplify import simplify_chains
 from utils.geometry import chaikin
@@ -247,10 +246,8 @@ def generate_branch(
         c_int, ei_int, nt, geoms, map_max, merge_dist_m=merge_junction_dist_m
     )
     nt = classify_nodes(c_int, ei_int, map_max, merge_dist_m=merge_junction_dist_m, compressed=True)
-    c_int, ei_int, nt, geoms = split_high_degree_junctions(
-        c_int, ei_int, nt, geoms, map_max, split_radius_m=3.0
-    )
-    # Merge split sub-nodes (3m apart) back when appropriate
+    # NOTE: the tactics2d Intersection builder supports 3-6 arms directly, so
+    # high-degree junctions (>=5) are no longer split into sub-junctions.
     c_int, ei_int, nt, geoms = merge_nearby_junctions(
         c_int, ei_int, nt, geoms, map_max, merge_dist_m=merge_junction_dist_m
     )

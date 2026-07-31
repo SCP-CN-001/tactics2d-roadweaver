@@ -59,7 +59,6 @@ from network_generator.topology.graph_refine import (
     merge_compressed_graph,
     merge_nearby_junctions,
     merge_parallel_edges,
-    split_high_degree_junctions,
 )
 from network_generator.topology.graph_simplify import simplify_chains
 from network_generator.topology.graph_utils import (
@@ -245,10 +244,8 @@ def main():
             c7, e7, nt, geoms = merge_nearby_junctions(
                 c7, e7, nt, geoms, map_max, merge_dist_m=50.0
             )
-            # ── Split degree>=5 junctions into sub-junctions ──────────
-            c7, e7, nt, geoms = split_high_degree_junctions(
-                c7, e7, nt, geoms, map_max, split_radius_m=3.0
-            )
+            # NOTE: the tactics2d Intersection builder supports 3-6 arms
+            # directly, so high-degree junctions are NOT split here.
 
             # ── Second parallel-road cleanup (after structural changes)
             c7, e7, geoms = clean_parallel_roads(
@@ -256,9 +253,9 @@ def main():
             )
 
             # ── Re-fix crossings created by structural ops ───────────
-            # merge_nearby_junctions / split_high_degree_junctions move edge
-            # endpoints and can introduce new geometric crossings; fix them
-            # after all structural changes (matches pipeline.py generate_branch).
+            # merge_nearby_junctions moves edge endpoints and can introduce
+            # new geometric crossings; fix them after all structural changes
+            # (matches pipeline.py generate_branch).
             c7, e7, geoms = fix_edge_crossings(c7, e7, geoms, map_max)
 
             # ── Re-align geometry endpoints to node positions ────────
@@ -457,6 +454,14 @@ def main():
                 map_w=d["map_w"],
                 map_h=d["map_h"],
             )
+            # Official tactics2d renderer: solid filled roads/junctions, useful
+            # for inspecting the true map state (lanes black, junctions black).
+            try:
+                from render_tactics2d import render_map
+
+                render_map(hd, OUT / f"s{idx}_t2d.png")
+            except Exception as _re:
+                print(f"  [t2d render] failed: {_re}")
             for lane in hd.lanes.values():
                 try:
                     if lane.id_.startswith("e"):
