@@ -24,16 +24,14 @@ import torch
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from network_generator.backbone.generator import Generator
+from network_generator.backbone.generator import Generator, make_generator
 from network_generator.growth.config import GrowthConfig
 from network_generator.growth.growth import grow
 from network_generator.topology.connector import EndpointConnector
-from network_generator.topology.graph_ops import (
-    NT_ROUNDABOUT,
-    detect_roundabouts,
-    merge_close_nodes,
-    simplify_chains,
-)
+from network_generator.topology.graph_intersection import detect_roundabouts
+from network_generator.topology.graph_merge import merge_close_nodes
+from network_generator.topology.graph_simplify import simplify_chains
+from network_generator.topology.graph_utils import NT_ROUNDABOUT
 from network_generator.topology.raster_to_graph import field_to_graph
 
 DEFAULT_VQ = "runtimes/vq_vae_2km/checkpoints/best.pth"
@@ -76,9 +74,9 @@ def main():
     out_dir = f"analysis/generated/{vq_name}+{tfm_name}"
     os.makedirs(out_dir, exist_ok=True)
 
-    gen = Generator(
-        vq_checkpoint=args.vq,
-        model_checkpoint=args.transformer,
+    gen = make_generator(
+        args.vq,
+        args.transformer,
         cache_path=args.cache,
         device=args.device,
         d_model=args.d_model,
@@ -87,6 +85,7 @@ def main():
         num_codes=args.codes,
         resolution=args.res,
         code_map_size=args.code_map,
+        use_adaln=False,  # demo_generate historically used the Generator default
     )
     print(f"Output → {out_dir}/")
 

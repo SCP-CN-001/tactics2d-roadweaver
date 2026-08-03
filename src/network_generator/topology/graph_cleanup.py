@@ -283,6 +283,11 @@ def fix_edge_crossings(coords, edge_index, geometries, map_size_m):
         )
         deduped: list[tuple[float, np.ndarray]] = []
         for f, p in cuts:
+            if f < 1e-3 or f > 1.0 - 1e-3:
+                # Crossing lands at (or right next to) this edge's own endpoint.
+                # Splitting there would create a zero-length sub-edge with a
+                # degenerate geometry collapsed to the endpoint node.
+                continue
             if not deduped or f - deduped[-1][0] > 1e-4:
                 deduped.append((f, p))
 
@@ -312,13 +317,14 @@ def fix_edge_crossings(coords, edge_index, geometries, map_size_m):
             prev_pt = p
             prev_cum = target_cum
 
-        # Final segment to v.
+        # Final segment to v.  prev_pt already lies at arc-length prev_cum; append
+        # every subsequent geometry vertex and force the endpoint to be v exactly.
         sub_pts = [prev_pt.copy()]
         for k in range(1, len(g)):
-            if cum[k] <= prev_cum + 1e-12:
-                continue
-            t = (max(prev_cum, cum[k - 1]) - cum[k - 1]) / (cum[k] - cum[k - 1] + 1e-12)
-            sub_pts.append(g[k - 1] + t * (g[k] - g[k - 1]))
+            if cum[k] > prev_cum + 1e-12:
+                sub_pts.append(g[k].copy())
+        if np.linalg.norm(np.asarray(sub_pts[-1]) - np.asarray(c[v], dtype=float)) > 1e-9:
+            sub_pts.append(np.asarray(c[v], dtype=float))
         if len(sub_pts) >= 2:
             out_ei.append((prev_node, v))
             out_geoms.append(np.array(sub_pts))

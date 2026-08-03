@@ -21,7 +21,7 @@ from network_generator.backbone.config import CONFIG
 from network_generator.backbone.dataset import make_field_dataloader
 from network_generator.backbone.vq_vae import VQVAE
 
-CKPT = "runtimes/vq_vae_5km_32/checkpoints/best.pth"
+CKPT = "runtimes/vq_vae_2km_phase_a/checkpoints/best.pth"
 OUTPUT = "analysis/vq_recon"
 N_SAMPLES = 8
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -30,15 +30,15 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 def main():
     os.makedirs(OUTPUT, exist_ok=True)
 
-    CONFIG.train_split_path = "data/urban_prior/5km/splits/train.parquet"
-    CONFIG.val_split_path = "data/urban_prior/5km/splits/val.parquet"
+    CONFIG.train_split_path = "data/urban_prior/2km/splits/train.parquet"
+    CONFIG.val_split_path = "data/urban_prior/2km/splits/val.parquet"
 
     loader = make_field_dataloader(
         "val", batch_size=N_SAMPLES, shuffle=True, num_workers=2, limit_samples=200, resolution=128
     )
 
     # Load model
-    model = VQVAE(resolution=128, num_codes=1024, code_map_size=32).to(DEVICE)
+    model = VQVAE(resolution=128, num_codes=512, code_map_size=32).to(DEVICE)
     state = torch.load(CKPT, map_location=DEVICE, weights_only=True)
     model.load_state_dict(state["model_state_dict"])
     model.eval()

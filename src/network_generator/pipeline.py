@@ -34,8 +34,10 @@ from network_generator.topology.graph_refine import (
     fix_abnormal_edges,
     fix_growth_crossings,
     merge_compressed_graph,
+    merge_near_miss_edges,
     merge_nearby_junctions,
     merge_parallel_edges,
+    remove_redundant_chords,
     snap_edges_to_nodes,
 )
 from network_generator.topology.graph_simplify import simplify_chains
@@ -158,6 +160,9 @@ def generate_branch(
     parallel_angle_deg: float = 30.0,
     parallel_dist_m: float = 40.0,
     merge_junction_dist_m: float = 50.0,
+    chord_dup_dist_m: float = 40.0,
+    chord_detour_ratio: float = 0.10,
+    chord_angle_deg: float = 20.0,
 ) -> dict:
     """Grow collector roads (G1) and local roads (G2), then clean up.
 
@@ -265,8 +270,21 @@ def generate_branch(
     c_int, ei_int, geoms = snap_edges_to_nodes(c_int, ei_int, geoms, map_max, snap_dist_m=8.0)
     # Crossing fix (shared implementation — one-pass + spatial index)
     c_int, ei_int, geoms = fix_edge_crossings(c_int, ei_int, geoms, map_max)
+    # Near-miss edges (close but not crossing) get a shared intersection node.
+    c_int, ei_int, geoms = merge_near_miss_edges(c_int, ei_int, geoms, map_max)
     c_int, ei_int, geoms = merge_parallel_edges(
         c_int, ei_int, geoms, map_max, angle_deg=parallel_angle_deg, dist_m=parallel_dist_m
+    )
+    # Chord (u,v) vs two-edge path u-w-v: shares endpoints with both path
+    # edges, so it escapes all parallel cleanup — remove it explicitly.
+    c_int, ei_int, geoms = remove_redundant_chords(
+        c_int,
+        ei_int,
+        geoms,
+        map_max,
+        max_dist_m=chord_dup_dist_m,
+        detour_ratio=chord_detour_ratio,
+        angle_deg=chord_angle_deg,
     )
     c_int, ei_int, geoms = clean_parallel_roads(
         c_int, ei_int, geoms, map_max, angle_deg=parallel_angle_deg, max_dist_m=parallel_dist_m

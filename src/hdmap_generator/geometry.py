@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import numpy as np
-from shapely.geometry import LineString as _LineString
-from shapely.geometry import Point as _Point
 
 from utils.geometry import chaikin as _chaikin_keep_ends
 from utils.geometry import segment_intersection as _segment_intersection
@@ -43,22 +41,6 @@ def smooth(pts):
         return pts
 
 
-def offset(pts: np.ndarray, d: float) -> np.ndarray:
-    """Offset centreline using Shapely ``offset_curve``.
-
-    Shapely's implementation inserts circular arcs at tight corners
-    instead of sharp angles, producing far fewer self-intersecting
-    boundaries than the manual per-segment approach.
-    """
-    if len(pts) < 2:
-        return pts
-
-    result = _LineString(pts).offset_curve(d)
-    if result.geom_type == "LineString" and len(result.coords) >= 2:
-        return np.array(result.coords, dtype=np.float64)
-    return pts
-
-
 def geom(e, geoms_m, c, ei):
     """Return the geometry of an edge."""
     if e < len(geoms_m) and len(geoms_m[e]) >= 2:
@@ -67,67 +49,14 @@ def geom(e, geoms_m, c, ei):
     return np.array([c[u], c[v]])
 
 
-# ---------------------------------------------------------------------------
-#  Self-intersection fix  (cut at crossing point)
-# ---------------------------------------------------------------------------
-
-
-def cut_at_self_intersection(coords: np.ndarray) -> np.ndarray:
-    """Walk the polyline and truncate before the first crossing segment.
-
-    When a lane boundary self-intersects (a small loop at a tight corner),
-    this function removes the loop by cutting off everything from the
-    crossing segment onward.  The remaining clean portion is returned.
-    """
-    n = len(coords)
-    if n < 4:
-        return coords
-    for i in range(1, n - 2):
-        p1, p2 = coords[i], coords[i + 1]
-        for j in range(0, i - 1):
-            q1, q2 = coords[j], coords[j + 1]
-            if _segment_intersection(p1, p2, q1, q2) is not None:
-                return coords[: i + 1]
-    return coords
-
-
-def trim_offset_caps(boundary: np.ndarray, centerline: np.ndarray, d: float) -> np.ndarray:
-    """Remove the round cap arcs ``offset_curve`` adds at both ends.
-
-    ``offset_curve`` closes each end with a semicircular cap centred on the
-    centreline endpoint; the cap's interior points sit close to the centreline
-    and pinch the lane to zero width there (the "hollow" seen near roads).
-    Keep only the points that are at roughly the intended offset distance
-    from the centreline.
-    """
-    if len(boundary) < 3:
-        return boundary
-    ls = _LineString(centerline)
-    min_d = abs(d) * 0.85
-    start = 0
-    for k in range(len(boundary)):
-        if ls.distance(_Point(boundary[k])) >= min_d:
-            start = k
-            break
-    end = len(boundary)
-    for k in range(len(boundary) - 1, -1, -1):
-        if ls.distance(_Point(boundary[k])) >= min_d:
-            end = k + 1
-            break
-    if end - start < 2:
-        return boundary
-    return np.asarray(boundary[start:end])
-
-
 def self_intersection_frac(coords: np.ndarray) -> float | None:
     """Return the arc-length fraction of the first self-intersection, or None.
 
-    Unlike :func:`cut_at_self_intersection` (which returns the truncated
-    polyline), this reports *where* the boundary crosses itself so that both
-    lane boundaries can be cut at the *same* arc position.  Cutting only one
-    boundary (as the old code did) leaves the lane width collapsing to a
-    narrow sliver from the cut point onward — the "hollow" seen near
-    intersections.
+    Unlike a truncation that returns the truncated polyline, this reports
+    *where* the boundary crosses itself so that both lane boundaries can be
+    cut at the *same* arc position.  Cutting only one boundary (as the old
+    code did) leaves the lane width collapsing to a narrow sliver from the
+    cut point onward — the "hollow" seen near intersections.
     """
     n = len(coords)
     if n < 4:
@@ -172,9 +101,7 @@ def offset_per_point(pts: np.ndarray, d: float) -> np.ndarray:
     Offsets each point by *d* along the local perpendicular direction
     (averaged from neighbouring segments for interior points).  The
     result has sharp corners where the centreline turns, but those are
-    smoothed by the subsequent Chaikin pass.  Used as a fallback when
-    ``offset`` (Shapely) produces a self-intersection that cannot be
-    cleanly cut.
+    smoothed by the subsequent Chaikin pass.
     """
     n = len(pts)
     if n < 2:

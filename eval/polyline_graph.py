@@ -406,3 +406,203 @@ def save_vis(
     plt.savefig(filepath, dpi=300, bbox_inches="tight")
     plt.close()
     print(f"  [vis] Saved {filepath}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Clean map-only rendering (no mask / no graph analysis overlay)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def save_clean_map(
+    polylines: list[np.ndarray],
+    filepath: str,
+    dpi: int = 400,
+    figsize: tuple[int, int] | None = None,
+    title: str = "",
+    line_width: float = 1.5,
+    road_color: str = "#222222",
+    background: str = "white",
+    equal_axis: bool = True,
+) -> None:
+    """Render road polylines as a clean map — no binary mask, no graph overlay,
+    no node analysis annotations.
+
+    Produces a publication-ready figure showing only the road network.
+
+    When *figsize* is ``None`` (default), the figure dimensions are computed
+    automatically from the data bounding box so the map fills the canvas
+    without whitespace — roads are never distorted (``equal_axis`` is always
+    ``True`` internally).
+
+    Args:
+        polylines: List of ``(N_i, 2)`` arrays in any coordinate space.
+        filepath: Output PNG path.
+        dpi: Output resolution (default 400; use 300–600 for publication).
+        figsize: Figure size in inches (width, height).  If ``None``, computed
+                 from the data bounding box with a 10-inch max dimension.
+        title: Optional title text (displayed above the map).
+        line_width: Road centreline stroke width.
+        road_color: Road line colour.
+        background: Figure face colour.
+        equal_axis: Whether to enforce equal aspect ratio.
+    """
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    # ── Auto figsize from data bounding box ──────────────────────────────
+    if figsize is None and polylines:
+        all_pts = np.vstack(polylines)
+        x_min, y_min = all_pts.min(axis=0)
+        x_max, y_max = all_pts.max(axis=0)
+        w, h = x_max - x_min, y_max - y_min
+        max_side = max(w, h, 1.0)
+        # Scale so the longer side is 10 inches, preserving ratio
+        ratio = h / w if w > 0 else 1.0
+        if ratio >= 1.0:
+            figsize = (10.0 / ratio, 10.0)
+        else:
+            figsize = (10.0, 10.0 * ratio)
+    elif figsize is None:
+        figsize = (10, 10)
+
+    fig, ax = plt.subplots(1, 1, figsize=figsize)
+    if background:
+        ax.set_facecolor(background)
+        fig.patch.set_facecolor(background)
+    if equal_axis:
+        ax.set_aspect("equal")
+
+    for pts in polylines:
+        pts = np.asarray(pts)
+        if len(pts) >= 2:
+            ax.plot(pts[:, 0], pts[:, 1], color=road_color, lw=line_width)
+
+    if title:
+        ax.set_title(title, fontsize=14, pad=8)
+
+    ax.axis("off")
+    plt.tight_layout(pad=0)
+    Path(filepath).parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(filepath, dpi=dpi, bbox_inches="tight", pad_inches=0)
+    plt.close()
+    print(f"  [clean-map] Saved {filepath} ({dpi} dpi)")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Direct polyline → graph (no skeletonisation)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def polylines_to_graph_direct(
+    polylines: list[np.ndarray], merge_distance: float = -1.0
+) -> nx.Graph:
+    """Build a graph directly from polylines by spatial clustering.
+
+    This avoids skeletonisation artefacts on curves and wide roads.
+
+    **Node definition** (matches the standard road-network model):
+      - Every polyline endpoint is a node.
+      - Any two points from different polylines that are within
+        *merge_distance* are clustered into **one** node (intersection).
+      - A long curve with no intersections has **only** its start and end
+        as nodes — the curve itself becomes one edge.
+
+    **Edge definition**:
+      - Walking along each polyline, every time we pass from one cluster
+        (node) to a different one we create an edge.
+      - Consecutive points in the *same* cluster are intermediate
+        waypoints belonging to the same road segment — they produce no
+        extra node or edge.
+
+    Args:
+        polylines: List of ``(N_i, 2)`` arrays in any coordinate space.
+        merge_distance: Radius for spatial clustering.  If ``<= 0`` it is
+            auto-computed as 2 % of the data extent.
+
+    Returns:
+        ``nx.Graph`` with ``"coords"`` (np.ndarray shape ``(2,)``) on every node.
+    """
+    from scipy.spatial import KDTree
+
+    if not polylines:
+        return nx.Graph()
+
+    # ── Extent & merge_distance ────────────────────────────────────────
+    all_pts = np.vstack(polylines)
+    xmin, ymin = all_pts.min(axis=0)
+    xmax, ymax = all_pts.max(axis=0)
+    extent = max(xmax - xmin, ymax - ymin, 1.0)
+    if merge_distance <= 0.0:
+        merge_distance = extent * 0.02
+
+    # ── Flatten: for each point record (poly_idx, pt_idx, coord) ───────
+    flat_coords: list[np.ndarray] = []
+    point_meta: list[tuple[int, int]] = []  # (poly_idx, pt_idx)
+    for pi, pts in enumerate(polylines):
+        for pj in range(len(pts)):
+            flat_coords.append(pts[pj])
+            point_meta.append((pi, pj))
+    if not flat_coords:
+        return nx.Graph()
+    coords_arr = np.array(flat_coords)  # (M, 2)
+    M = len(coords_arr)
+
+    # ── Spatial clustering (KDTree + connected components) ──────────
+    tree = KDTree(coords_arr)
+    pairs = tree.query_pairs(r=merge_distance)
+
+    adj: dict[int, set[int]] = {i: set() for i in range(M)}
+    for i, j in pairs:
+        adj[i].add(j)
+        adj[j].add(i)
+
+    visited: set[int] = set()
+    cluster_id: list[int] = [-1] * M
+    n_clusters = 0
+    for i in range(M):
+        if i in visited:
+            continue
+        stack = [i]
+        cid = n_clusters
+        n_clusters += 1
+        while stack:
+            v = stack.pop()
+            if v in visited:
+                continue
+            visited.add(v)
+            cluster_id[v] = cid
+            for nb in adj[v]:
+                if nb not in visited:
+                    stack.append(nb)
+    # ── Build nodes from cluster centroids ─────────────────────────
+    # Also keep a mapping: poly_idx → list of (pt_idx, cluster_id)
+    # so we can walk polylines and create edges.
+    centroids = np.zeros((n_clusters, 2))
+    counts = np.zeros(n_clusters, dtype=int)
+    for i in range(M):
+        cid = cluster_id[i]
+        centroids[cid] += coords_arr[i]
+        counts[cid] += 1
+    centroids /= counts[:, None]
+
+    G = nx.Graph()
+    for cid in range(n_clusters):
+        G.add_node(cid, coords=centroids[cid])
+
+    # ── Walk each polyline to create edges ──────────────────────────
+    # For each polyline, find the sequence of clusters along it.
+    # Consecutive *different* clusters → one edge (deduplicated).
+    flat_idx = 0
+    for pi, pts in enumerate(polylines):
+        prev_cluster: int | None = None
+        for _pj in range(len(pts)):
+            cid = cluster_id[flat_idx]
+            flat_idx += 1
+            if prev_cluster is not None and cid != prev_cluster:
+                u, v = (prev_cluster, cid) if prev_cluster < cid else (cid, prev_cluster)
+                G.add_edge(u, v)
+            prev_cluster = cid
+
+    return G

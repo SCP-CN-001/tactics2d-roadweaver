@@ -126,8 +126,6 @@ def main():
     MODEL_CKPT = "runtimes/transformer_2km_phase_a/checkpoints/best.pth"
     CACHE = "cache/masked_code_maps_2km_phase_a/train.npz"
     DEVICE = "cuda"
-    OUT = Path("analysis/viz")
-    OUT.mkdir(parents=True, exist_ok=True)
     VQ_MAP_SIZE_M = 2000.0
     MIN_SPACING_M = 80.0
     MAP_SIZES = [(2000, 2000), (3000, 2000), (2000, 3000), (4000, 2000), (2000, 4000), (5000, 2000)]
@@ -306,131 +304,56 @@ def main():
 
     # ── Plot ──
     print(f"\nPlotting {len(all_data)}...")
+    OUT = Path("analysis/roadweaver")
     SKEL = "#F9A825"
 
     for idx, d in enumerate(all_data):
-        fig = plt.figure(figsize=(18, 9))
-        gs = fig.add_gridspec(2, 4, width_ratios=[1, 1, 1, 1.3], hspace=0.2, wspace=0.15)
-        fig.suptitle(
-            f"{d['pattern']} dens={d['density']:.1f} {d['map_w']}x{d['map_h']}m {d['time']:.1f}s",
-            fontsize=13,
-            y=0.98,
-        )
+        folder = OUT / f"map_{idx}_{d['map_w']}x{d['map_h']}"
+        folder.mkdir(parents=True, exist_ok=True)
 
+        # ---- Panel 0: Field only (no graph overlay) --------------
+        fig0, ax0 = plt.subplots(figsize=(8, 8))
+        ax0.set_title("0 Field Only", fontsize=12)
+        _draw_field(ax0, d["field"], extent=(0, 1, 0, 1), origin="lower")
+        ax0.set_xlim(-0.02, 1.02)
+        ax0.set_ylim(-0.02, 1.02)
+        ax0.set_aspect("equal")
+        ax0.axis("off")
+        fig0.savefig(folder / "0_Field_Only.png", dpi=200, bbox_inches="tight")
+        plt.close(fig0)
+
+        # Panel definitions: (filename, title, coords, edges, bg_field, node_color, edge_lw)
         panels = [
-            (fig.add_subplot(gs[0, 0]), "1 VQ Field", d["c1"], d["e1"], d["field"], SKEL, 0.7),
-            (fig.add_subplot(gs[0, 1]), "2 Skeleton", d["c2"], d["e2"], d["field"], SKEL, 0.7),
-            (fig.add_subplot(gs[0, 2]), "3 Scaled+clean", d["c4"], d["e4"], None, SKEL, 0.7),
-            (fig.add_subplot(gs[1, 0]), "4 Growth", d["c5"], d["e5"], None, "#888", 0.5),
-            (fig.add_subplot(gs[1, 1]), "5 Cleanup", d["c6"], d["e6"], None, "#888", 0.5),
-            (fig.add_subplot(gs[1, 2]), "6 Intersection Graph", d["c7"], d["e7"], None, None, None),
+            ("1_VQ_Field.png", "1 VQ Field", d["c1"], d["e1"], d["field"], SKEL, 0.7),
+            ("2_Skeleton.png", "2 Skeleton", d["c2"], d["e2"], d["field"], SKEL, 0.7),
+            ("3_Scaled+clean.png", "3 Scaled+clean", d["c4"], d["e4"], None, SKEL, 0.7),
+            ("4_Growth.png", "4 Growth", d["c5"], d["e5"], None, "#888", 0.5),
+            ("5_Cleanup.png", "5 Cleanup", d["c6"], d["e6"], None, "#888", 0.5),
         ]
 
-        for ax, title, c, e, bg, nc, lw in panels:
-            ax.set_title(title, fontsize=10)
+        # ---- Panels 1-5: simple graph / field renders ------------
+        for fname, title, c, e, bg, nc, lw in panels:
+            fig, ax = plt.subplots(figsize=(8, 8))
+            ax.set_title(title, fontsize=12)
             if bg is not None:
                 _draw_field(ax, bg, extent=(0, 1, 0, 1), origin="lower")
             else:
                 ax.set_facecolor("#f5f5f5")
-            px = c if len(c) else []
-            if title.startswith("6"):
-                nt = d["nt"]
-                lanes_arr = d["lanes"]
-                rc_arr = d.get("rc_int")
-                if len(px):
-                    for j, (u, v) in enumerate(e):
-                        lw = min(3.0, 0.3 + 0.35 * int(lanes_arr[j]) if j < len(lanes_arr) else 0.5)
-                        rc = int(rc_arr[j]) if rc_arr is not None and j < len(rc_arr) else 2
-                        hue = {1: 150, 2: 280, 3: 40}.get(rc, 100)
-                        color = husl.husl_to_hex(hue, 65, 55)
-                        geom = d["geoms"][j] if j < len(d["geoms"]) else None
-                        if geom is not None and len(geom) > 2:
-                            ax.plot(geom[:, 0], geom[:, 1], color=color, lw=lw, alpha=0.7)
-                        else:
-                            ax.plot(
-                                [px[u, 0], px[v, 0]],
-                                [px[u, 1], px[v, 1]],
-                                color=color,
-                                lw=lw,
-                                alpha=0.7,
-                            )
-                    jm = nt == NT_JUNCTION
-                    rm = nt == NT_ROUNDABOUT
-                    em = nt == NT_ENDPOINT
-                    if jm.any():
-                        ax.scatter(
-                            px[jm, 0],
-                            px[jm, 1],
-                            c="#1565C0",
-                            s=30,
-                            edgecolors="black",
-                            lw=0.4,
-                            zorder=3,
-                            label=f"J ({jm.sum()})",
-                        )
-                    if rm.any():
-                        ax.scatter(
-                            px[rm, 0],
-                            px[rm, 1],
-                            c="#E53935",
-                            s=30,
-                            edgecolors="black",
-                            lw=0.4,
-                            zorder=3,
-                            label=f"R ({rm.sum()})",
-                        )
-                    if em.any():
-                        ax.scatter(
-                            px[em, 0],
-                            px[em, 1],
-                            c="#FDD835",
-                            s=12,
-                            edgecolors="black",
-                            lw=0.2,
-                            zorder=3,
-                            label=f"E ({em.sum()})",
-                        )
-                ax.legend(fontsize=7, loc="lower right", framealpha=0.8)
-                n1, n2, n3 = (
-                    int((lanes_arr == 1).sum()),
-                    int((lanes_arr == 2).sum()),
-                    int((lanes_arr >= 3).sum()),
+            if len(c):
+                _draw_graph(
+                    ax,
+                    c,
+                    e,
+                    np.zeros(len(c), dtype=np.int64),
+                    edge_color="k",
+                    edge_lw=lw,
+                    edge_alpha=0.5,
+                    node_color=nc,
+                    node_size=lambda n: max(2, 12 - n // 50),
+                    fixed_limits=None,
+                    hide_axes=False,
                 )
-                ax.text(
-                    0.02,
-                    0.98,
-                    f"L:1x{n1} 2x{n2} 3+x{n3}",
-                    transform=ax.transAxes,
-                    fontsize=8,
-                    va="top",
-                    bbox=dict(boxstyle="round", facecolor="white", alpha=0.8),
-                )
-            else:
-                if len(px):
-                    _draw_graph(
-                        ax,
-                        c,
-                        e,
-                        np.zeros(len(c), dtype=np.int64),
-                        edge_color="k",
-                        edge_lw=lw,
-                        edge_alpha=0.5,
-                        node_color=nc,
-                        node_size=lambda n: max(2, 12 - n // 50),
-                        fixed_limits=None,
-                        hide_axes=False,
-                    )
-            ax.text(
-                0.02,
-                0.02,
-                f"{len(c)}n {len(e)}e",
-                transform=ax.transAxes,
-                fontsize=8,
-                va="bottom",
-                bbox=dict(boxstyle="round", facecolor="white", alpha=0.7),
-            )
-            if len(px):
-                xs, ys = px[:, 0], px[:, 1]
+                xs, ys = c[:, 0], c[:, 1]
                 mx = max(0.02, (xs.max() - xs.min()) * 0.05)
                 my = max(0.02, (ys.max() - ys.min()) * 0.05)
                 ax.set_xlim(xs.min() - mx, xs.max() + mx)
@@ -440,90 +363,183 @@ def main():
                 ax.set_ylim(-0.02, 1.02)
             ax.set_aspect("equal")
             ax.axis("off")
+            fig.savefig(folder / fname, dpi=200, bbox_inches="tight")
+            plt.close(fig)
 
-        # ---- Right column: HD Map (spans both rows) ----
-        ax_hd = fig.add_subplot(gs[0:2, 3])
+        # ---- Panel 6: Intersection Graph -------------------------
+        c7, e7 = d["c7"], d["e7"]
+        nt = d["nt"]
+        lanes_arr = d["lanes"]
+        rc_arr = d.get("rc_int")
+        geoms = d["geoms"]
+
+        fig6, ax6 = plt.subplots(figsize=(10, 8))
+        ax6.set_title("6 Intersection Graph", fontsize=12)
+        ax6.set_facecolor("#f5f5f5")
+
+        n_j = int((nt == NT_JUNCTION).sum())
+        n_r = int((nt == NT_ROUNDABOUT).sum())
+        n_e = int((nt == NT_ENDPOINT).sum())
+
+        if len(c7):
+            # Draw edges colored by road class
+            rc_colors = {
+                1: husl.husl_to_hex(150, 65, 55),  # green
+                2: husl.husl_to_hex(280, 65, 55),  # purple
+                3: husl.husl_to_hex(40, 65, 55),
+            }  # orange
+            for j, (u, v) in enumerate(e7):
+                lw = min(3.0, 0.3 + 0.35 * int(lanes_arr[j]) if j < len(lanes_arr) else 0.5)
+                rc = int(rc_arr[j]) if rc_arr is not None and j < len(rc_arr) else 2
+                color = rc_colors.get(rc, "#888")
+                geom = geoms[j] if j < len(geoms) else None
+                if geom is not None and len(geom) > 2:
+                    ax6.plot(geom[:, 0], geom[:, 1], color=color, lw=lw, alpha=0.7)
+                else:
+                    ax6.plot(
+                        [c7[u, 0], c7[v, 0]], [c7[u, 1], c7[v, 1]], color=color, lw=lw, alpha=0.7
+                    )
+
+            # Draw nodes
+            if n_j:
+                ax6.scatter(
+                    c7[nt == NT_JUNCTION, 0],
+                    c7[nt == NT_JUNCTION, 1],
+                    c="#1565C0",
+                    s=40,
+                    edgecolors="black",
+                    lw=0.5,
+                    zorder=3,
+                )
+            if n_r:
+                ax6.scatter(
+                    c7[nt == NT_ROUNDABOUT, 0],
+                    c7[nt == NT_ROUNDABOUT, 1],
+                    c="#E53935",
+                    s=40,
+                    edgecolors="black",
+                    lw=0.5,
+                    zorder=3,
+                )
+            if n_e:
+                ax6.scatter(
+                    c7[nt == NT_ENDPOINT, 0],
+                    c7[nt == NT_ENDPOINT, 1],
+                    c="#FDD835",
+                    s=16,
+                    edgecolors="black",
+                    lw=0.3,
+                    zorder=3,
+                )
+
+            xs, ys = c7[:, 0], c7[:, 1]
+            mx = max(0.02, (xs.max() - xs.min()) * 0.05)
+            my = max(0.02, (ys.max() - ys.min()) * 0.05)
+            ax6.set_xlim(xs.min() - mx, xs.max() + mx)
+            ax6.set_ylim(ys.min() - my, ys.max() + my)
+
+        # Legend outside the plot
+        from matplotlib.lines import Line2D
+
+        legend_items = []
+        if n_j:
+            legend_items.append(
+                Line2D(
+                    [0],
+                    [0],
+                    marker="o",
+                    color="w",
+                    markerfacecolor="#1565C0",
+                    markeredgecolor="black",
+                    markersize=8,
+                    label=f"Junction ({n_j})",
+                )
+            )
+        if n_r:
+            legend_items.append(
+                Line2D(
+                    [0],
+                    [0],
+                    marker="o",
+                    color="w",
+                    markerfacecolor="#E53935",
+                    markeredgecolor="black",
+                    markersize=8,
+                    label=f"Roundabout ({n_r})",
+                )
+            )
+        if n_e:
+            legend_items.append(
+                Line2D(
+                    [0],
+                    [0],
+                    marker="o",
+                    color="w",
+                    markerfacecolor="#FDD835",
+                    markeredgecolor="black",
+                    markersize=6,
+                    label=f"Endpoint ({n_e})",
+                )
+            )
+        for rc_label, rc_val, hue in [
+            ("Primary (1)", 1, 150),
+            ("Secondary (2)", 2, 280),
+            ("Local (3)", 3, 40),
+        ]:
+            legend_items.append(
+                Line2D([0], [0], color=husl.husl_to_hex(hue, 65, 55), lw=2, label=rc_label)
+            )
+        for lw_val, label in [(0.65, "1 lane"), (1.0, "2 lanes"), (1.35, "3+ lanes")]:
+            legend_items.append(Line2D([0], [0], color="#555", lw=lw_val, label=label))
+
+        ax6.legend(
+            handles=legend_items,
+            fontsize=8,
+            loc="upper left",
+            bbox_to_anchor=(1.02, 1),
+            borderaxespad=0,
+            framealpha=0.9,
+        )
+        ax6.set_aspect("equal")
+        ax6.axis("off")
+        fig6.savefig(folder / "6_Intersection_Graph.png", dpi=200, bbox_inches="tight")
+        plt.close(fig6)
+
+        # ---- Panel 7: HD Map (tactics2d renderer) ----------------
         try:
             hd = graph_to_map(
-                d["c7"],
-                d["e7"],
-                d["geoms"],
-                node_types=d["nt"],
-                lanes_per_dir=d["lanes"],
-                road_class=d.get("road_class"),
+                c7,
+                e7,
+                geoms,
+                node_types=nt,
+                lanes_per_dir=lanes_arr,
+                road_class=rc_arr,
                 map_w=d["map_w"],
                 map_h=d["map_h"],
             )
-            # Official tactics2d renderer: solid filled roads/junctions, useful
-            # for inspecting the true map state (lanes black, junctions black).
-            try:
-                from render_tactics2d import render_map
+            from render_tactics2d import render_map
 
-                render_map(hd, OUT / f"s{idx}_t2d.png")
-            except Exception as _re:
-                print(f"  [t2d render] failed: {_re}")
-            for lane in hd.lanes.values():
-                try:
-                    if lane.id_.startswith("e"):
-                        c, lw = "#222", 0.5
-                    elif lane.id_.startswith("ra"):
-                        c, lw = "#666", 0.4
-                    elif lane.id_.startswith("int"):
-                        c, lw = "#999", 0.3
-                    else:
-                        c, lw = "#222", 0.3
-                    for side in (lane.left_side, lane.right_side):
-                        if side is not None and not is_empty(side):
-                            x, y = side.xy
-                            ax_hd.plot(x, y, color=c, lw=lw, alpha=0.85)
-                except:
-                    pass
-            for junc in (hd.junctions or {}).values():
-                try:
-                    shape = getattr(junc, "custom_tags", {}).get("shape", [])
-                    if shape and len(shape) > 2:
-                        xs, ys = zip(*shape)
-                        ax_hd.fill(xs, ys, alpha=0.25, color="#888")
-                        ax_hd.plot(xs + (xs[0],), ys + (ys[0],), color="#555", lw=1.5, alpha=0.7)
-                except:
-                    pass
-            for area in (hd.areas or {}).values():
-                try:
-                    if area.geometry and not is_empty(area.geometry):
-                        x, y = area.geometry.exterior.xy
-                        ax_hd.fill(x, y, alpha=0.25, color="#aaa")
-                except:
-                    pass
-            all_l = list(hd.lanes.values())
-            n_road = sum(1 for l in all_l if l.id_.startswith("e"))
-            n_ra = sum(1 for l in all_l if l.id_.startswith("ra"))
-            n_int = sum(1 for l in all_l if l.id_.startswith("int"))
-            n_junc = len(hd.junctions or {})
-            n_area = len(hd.areas or {})
-            dead = sum(1 for l in all_l if l.id_.startswith("e") and not l.successors)
-            ax_hd.set_title(
-                f"HD Map -- {n_road}r {n_ra}ra {n_int}int {n_junc}junc {dead}dead", fontsize=10
-            )
+            render_map(hd, str(folder / "7_HD_Map.png"))
         except Exception as exc:
-            ax_hd.text(
+            print(f"  [map_{idx}] HD Map failed: {exc}")
+            # Fallback: save empty placeholder
+            fig7, ax7 = plt.subplots(figsize=(8, 8))
+            ax7.text(
                 0.5,
                 0.5,
-                f"HD Map failed: {exc}",
+                f"HD Map failed:\n{exc}",
                 ha="center",
                 va="center",
-                transform=ax_hd.transAxes,
-                fontsize=10,
+                transform=ax7.transAxes,
+                fontsize=12,
             )
-        ax_hd.set_aspect("equal")
-        ax_hd.axis("off")
+            ax7.axis("off")
+            fig7.savefig(folder / "7_HD_Map.png", dpi=200)
+            plt.close(fig7)
 
-        plt.savefig(
-            OUT / f"s{idx}_{d['pattern']}_{d['map_w']}x{d['map_h']}.png",
-            dpi=300,
-            bbox_inches="tight",
-        )
-        plt.close()
-    print(f"Done ({len(all_data)} images)")
+        print(f"  [{idx}] → {folder}")
+
+    print(f"Done ({len(all_data)} maps)")
 
 
 if __name__ == "__main__":

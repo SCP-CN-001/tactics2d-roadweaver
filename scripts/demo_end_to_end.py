@@ -14,40 +14,30 @@ import os
 import matplotlib
 
 matplotlib.use("Agg")
-# ── Imports from unmigrated modules (src_old) ────────────────────────
-import sys
-
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
-from graph_refiner.endpoint_connector import EndpointConnector
-from graph_refiner.road_growth.config import GrowthConfig
-from graph_refiner.road_growth.growth import grow
 
 from network_generator.backbone.config import CONFIG
 from network_generator.backbone.dataset import make_field_dataloader
 from network_generator.backbone.transformer import MaskedCodeModel
 from network_generator.backbone.vq_vae import VQVAE
+from network_generator.growth.config import GrowthConfig
+from network_generator.growth.growth import grow
+from network_generator.topology.connector import EndpointConnector
+from network_generator.topology.graph_intersection import detect_roundabouts
+from network_generator.topology.graph_merge import merge_close_nodes
+from network_generator.topology.graph_simplify import simplify_chains
+from network_generator.topology.graph_utils import NT_CURVE, NT_ENDPOINT, NT_ROUNDABOUT, NT_WAYPOINT
 from network_generator.topology.raster_to_graph import field_to_graph
-from utils.graph_ops import (
-    NT_CURVE,
-    NT_ENDPOINT,
-    NT_ROUNDABOUT,
-    NT_WAYPOINT,
-    detect_roundabouts,
-    merge_close_nodes,
-    simplify_chains,
-)
-
-sys.path.insert(0, "src_old")
 
 # ── Config ───────────────────────────────────────────────────────────
-VQ_CKPT = "runtimes/vq_vae_5km_new/checkpoints/best.pth"
-TRANSFORMER_CKPT = "runtimes/transformer_5km_style_new/checkpoints/best.pth"
-RES = 256
-CODE_MAP_SIZE = 64
-NUM_CODES = 1024
-MAP_SIZE = 5000.0
+VQ_CKPT = "runtimes/vq_vae_2km_phase_a/checkpoints/best.pth"
+TRANSFORMER_CKPT = "runtimes/transformer_2km_phase_a/checkpoints/best.pth"
+RES = 128
+CODE_MAP_SIZE = 32
+NUM_CODES = 512
+MAP_SIZE = 2000.0
 N_SEEDS = 4
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 OUT = "analysis/demo_e2e"
@@ -70,7 +60,7 @@ model.load_state_dict(state["model_state_dict"], strict=False)
 print(f"  Models loaded (code_map={CODE_MAP_SIZE}x{CODE_MAP_SIZE})")
 
 # ── Load validation conditions ───────────────────────────────────────
-CONFIG.val_split_path = "data/urban_prior/5km/splits_keras/val.parquet"
+CONFIG.val_split_path = "data/urban_prior/2km/splits_style/val.parquet"
 ds = make_field_dataloader(
     "val", batch_size=N_SEEDS, shuffle=True, num_workers=2, limit_samples=200, cache_fields=False
 )

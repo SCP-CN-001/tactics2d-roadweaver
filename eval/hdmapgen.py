@@ -28,7 +28,6 @@ import argparse
 import pickle
 import sys
 import time
-from collections import defaultdict
 from pathlib import Path
 
 import networkx as nx
@@ -41,17 +40,16 @@ from eval.metrics import (
     append_csv_row,
     classify_scale,
     compute_all_geometric_metrics,
+    compute_cycle_ratio,
     compute_route_coverage,
     compute_subnode_uniformity,
     compute_topological_metrics,
     contract_degree2_nodes,
-    get_resource_stats,
     load_csv_keys,
+    load_csv_rows,
     load_osm_reference_degree,
     monitor_resources,
-    print_results_table,
-    save_results,
-    save_system_info,
+    save_binned_summary,
 )
 from eval.polyline_graph import polylines_to_graph, save_vis
 
@@ -275,298 +273,14 @@ def regenerate_graphs() -> list[dict]:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  Section 1: Topological Validity  (Table 1)
-# ═══════════════════════════════════════════════════════════════════════════
-
-
-def run_topology_eval(
-    graph_method: str = "legacy",
-    output_dir: Path = OUTPUT_DIR,
-    vis_dir: Path | None = None,
-    max_maps: int = 0,
-) -> dict:
-    """Load graphs and compute topological validity."""
-    print(f"\n{'=' * 60}")
-    print("Section 1: Topological Validity  (HDMapGen)")
-    print(f"  Processing {len(load_generated_graphs())} graphs, " f"graph_method={graph_method}")
-    print(f"{'=' * 60}")
-
-    ref_deg = load_osm_reference_degree()
-    print(f"  OSM reference avg_degree = {ref_deg:.4f}")
-
-    data = load_generated_graphs()
-    if max_maps > 0:
-        data = data[:max_maps]
-    print(f"  Loaded {len(data)} graphs")
-
-    topo_metrics = defaultdict(list)
-    all_results = []
-    vis_counts: dict[str, int] = {}
-
-    for idx, entry in enumerate(data):
-        G = dict_to_nx(entry, graph_method=graph_method, scale_to_meters=_HDMAPGEN_METER_SCALE)
-        if G.number_of_nodes() < 2:
-            continue
-        topo = compute_topological_metrics(G, ref_avg_degree=ref_deg)
-        for k, v in topo.items():
-            topo_metrics[k].append(v)
-
-        scale = classify_scale(topo["node_count"])
-
-        # ── Save vis (up to 5 per scale) ──
-        if vis_dir is not None:
-            cnt = vis_counts.get(scale, 0)
-            if cnt < 5:
-                polylines = extract_polylines_from_subnodes(
-                    entry, scale_to_meters=_HDMAPGEN_METER_SCALE
-                )
-                nc, ec = G.number_of_nodes(), G.number_of_edges()
-                vis_path = Path(vis_dir) / f"hd_{scale}_N{nc}E{ec}_{cnt}.png"
-                vis_path.parent.mkdir(parents=True, exist_ok=True)
-                save_vis(polylines, G, str(vis_path), resolution=1024, title=f"HDMapGen {scale}")
-                vis_counts[scale] = cnt + 1
-
-        all_results.append(
-            {
-                "num_nodes": entry["num_nodes"],
-                "gen_time_s": entry["gen_time_s"],
-                "scale": scale,
-                **topo,
-            }
-        )
-
-    agg = {}
-    for k, v in topo_metrics.items():
-        agg[f"{k}_mean"] = float(np.mean(v))
-        agg[f"{k}_std"] = float(np.std(v))
-    agg["n_maps"] = len(all_results)
-    agg["osm_reference_avg_degree"] = ref_deg
-
-    save_results(output_dir, "topology", agg, all_results)
-    print_results_table(
-        "Topological Validity",
-        agg,
-        [
-            ("lcc", "LCC", ".4f"),
-            ("dead_end_ratio", "Dead-end", ".4f"),
-            ("delta_avg_degree", "Δd̄", ".4f"),
-        ],
-    )
-
-    return agg
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-#  Section 2: Route-Level Coverage  (Table 3)
-# ═══════════════════════════════════════════════════════════════════════════
-
-
-def run_route_eval(
-    n_pairs: int = 100,
-    graph_method: str = "legacy",
-    output_dir: Path = OUTPUT_DIR,
-    max_maps: int = 0,
-) -> dict:
-    """Compute route coverage."""
-    print(f"\n{'=' * 60}")
-    print("Section 2: Route-Level Coverage  (HDMapGen)")
-    print(f"  {n_pairs} OD pairs per graph (graph_method={graph_method})")
-    print(f"{'=' * 60}")
-
-    data = load_generated_graphs()
-    if max_maps > 0:
-        data = data[:max_maps]
-    print(f"  Loaded {len(data)} graphs")
-
-    route_metrics = defaultdict(list)
-    all_results = []
-
-    for idx, entry in enumerate(data):
-        G = dict_to_nx(entry, graph_method=graph_method, scale_to_meters=_HDMAPGEN_METER_SCALE)
-        if G.number_of_nodes() < 2:
-            continue
-        route = compute_route_coverage(G, n_pairs=n_pairs, seed=idx)
-        for k, v in route.items():
-            route_metrics[k].append(v)
-        all_results.append({"num_nodes": entry["num_nodes"], **route})
-
-    agg = {}
-    for k, v in route_metrics.items():
-        agg[f"{k}_mean"] = float(np.mean(v))
-        agg[f"{k}_std"] = float(np.std(v))
-    agg["n_maps"] = len(all_results)
-
-    save_results(output_dir, "route_coverage", agg, all_results)
-    print_results_table(
-        "Route Coverage",
-        agg,
-        [("reachable_ratio", "Reachable", ".4f"), ("avg_route_length", "Avg Length", ".1f")],
-    )
-
-    return agg
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-#  Section 3: Geometric Validity  (Table 2)
-# ═══════════════════════════════════════════════════════════════════════════
-
-
-def run_geometry_eval(
-    graph_method: str = "legacy", output_dir: Path = OUTPUT_DIR, max_maps: int = 0
-) -> dict:
-    """Compute all geometric metrics from generated edge subnodes."""
-    print(f"\n{'=' * 60}")
-    print("Section 3: Geometric Validity  (HDMapGen)")
-    print(
-        f"  (Internal: edge smoothness, self-intersection, length CV, "
-        f"uniformity, angles)  graph_method={graph_method}"
-    )
-    print(f"{'=' * 60}")
-
-    data = load_generated_graphs()
-    if max_maps > 0:
-        data = data[:max_maps]
-    print(f"  Loaded {len(data)} graphs")
-
-    geom_metrics = defaultdict(list)
-    all_results = []
-
-    for entry in data:
-        G = dict_to_nx(entry, graph_method=graph_method, scale_to_meters=_HDMAPGEN_METER_SCALE)
-        polylines = extract_polylines_from_subnodes(entry, scale_to_meters=_HDMAPGEN_METER_SCALE)
-        # Raw subnodes (pre-interpolation) for uniformity — cubic spline masks spacing
-        raw_polylines = extract_polylines_from_subnodes(
-            entry, interpolate=False, scale_to_meters=_HDMAPGEN_METER_SCALE
-        )
-
-        if polylines:
-            geo = compute_all_geometric_metrics(polylines, G=G)
-            geo.update(compute_subnode_uniformity(raw_polylines))  # raw, not interpolated
-        else:
-            geo = {"chamfer_loo": 0.0, "endpoint_alignment": 0.0}
-
-        entry_out = {"num_nodes": entry["num_nodes"], "num_edges": G.number_of_edges(), **geo}
-        for k, v in geo.items():
-            if isinstance(v, (int, float, np.floating, np.integer)):
-                geom_metrics[k].append(v)
-        all_results.append(entry_out)
-
-    agg = {}
-    for k, v in geom_metrics.items():
-        agg[f"{k}_mean"] = float(np.mean(v))
-        agg[f"{k}_std"] = float(np.std(v))
-    agg["n_maps"] = len(all_results)
-
-    save_results(output_dir, "geometry", agg, all_results)
-    print_results_table(
-        "Geometric Validity",
-        agg,
-        [
-            ("chamfer_loo", "Chamfer (LOO)", ".4f"),
-            ("endpoint_alignment", "Endpoint Align", ".4f"),
-            ("mean_turning_angle_deg", "Turning Angle", ".2f"),
-            ("mean_edge_length", "Edge Length", ".4f"),
-            ("cv_edge_length", "Length CV", ".3f"),
-            ("intersection_rate", "Intersect Rate", ".6f"),
-            ("mean_spacing_cv", "Subnode Uniformity", ".3f"),
-            ("mean_angle_deg", "Junction Angle", ".2f"),
-        ],
-    )
-
-    return agg
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-#  Section 4: Large-Scale Capability  (Figure)
-# ═══════════════════════════════════════════════════════════════════════════
-
-
-def run_scalability_eval(
-    graph_method: str = "legacy", output_dir: Path = OUTPUT_DIR, max_maps: int = 0
-) -> dict:
-    """Aggregate generation time vs node count."""
-    print(f"\n{'=' * 60}")
-    print("Section 4: Large-Scale Capability  (HDMapGen)")
-    print(f"  graph_method={graph_method}")
-    print(f"{'=' * 60}")
-
-    data = load_generated_graphs()
-    if max_maps > 0:
-        data = data[:max_maps]
-    print(f"  Loaded {len(data)} graphs")
-
-    by_size = defaultdict(list)
-    for entry in data:
-        n = entry["num_nodes"]
-        G = dict_to_nx(entry, graph_method=graph_method, scale_to_meters=_HDMAPGEN_METER_SCALE)
-        topo = compute_topological_metrics(G)
-        by_size[n].append(
-            {
-                "node_count": n,
-                "edge_count": G.number_of_edges(),
-                "generation_time": entry["gen_time_s"],
-                **{k: topo.get(k, 0) for k in ("lcc", "dead_end_ratio", "avg_degree")},
-            }
-        )
-
-    all_sizes = []
-    for n in tqdm(sorted(by_size.keys()), desc="Scaling"):
-        maps = by_size[n]
-        nodes = [m["node_count"] for m in maps]
-        times = [m["generation_time"] for m in maps]
-        lccs = [m["lcc"] for m in maps]
-        edges = [m["edge_count"] for m in maps]
-
-        all_sizes.append(
-            {
-                "target_nodes": n,
-                "aggregate": {
-                    "node_count_mean": float(np.mean(nodes)),
-                    "node_count_std": float(np.std(nodes)),
-                    "edge_count_mean": float(np.mean(edges)),
-                    "gen_time_mean": float(np.mean(times)),
-                    "gen_time_std": float(np.std(times)),
-                    "lcc_mean": float(np.mean(lccs)),
-                    "lcc_std": float(np.std(lccs)),
-                    "dead_end_ratio_mean": float(np.mean([m["dead_end_ratio"] for m in maps])),
-                    "dead_end_ratio_std": float(np.std([m["dead_end_ratio"] for m in maps])),
-                },
-            }
-        )
-        print(
-            f"    n={n:2d}: time={np.mean(times):.4f}s  "
-            f"edges={np.mean(edges):.0f}  LCC={np.mean(lccs):.3f}"
-        )
-
-    csv_path = output_dir / "scalability.csv"
-    with open(csv_path, "w") as f:
-        f.write(
-            "target_nodes,node_count_mean,node_count_std,edge_count_mean,"
-            "gen_time_mean,gen_time_std,lcc_mean,lcc_std\n"
-        )
-        for r in all_sizes:
-            a = r["aggregate"]
-            f.write(
-                f"{r['target_nodes']},{a['node_count_mean']},{a['node_count_std']},"
-                f"{a['edge_count_mean']},{a['gen_time_mean']},{a['gen_time_std']},"
-                f"{a['lcc_mean']},{a['lcc_std']}\n"
-            )
-    print(f"\n  CSV saved to {csv_path}")
-    return {"n_sizes": len(all_sizes)}
-
-
-# ═══════════════════════════════════════════════════════════════════════════
 #  CLI
 # ═══════════════════════════════════════════════════════════════════════════
 
 
 def main():
     parser = argparse.ArgumentParser(description="HDMapGen baseline evaluation")
-    parser.add_argument("--all", action="store_true", help="Run all sections")
-    parser.add_argument("--topology", action="store_true", help="Topological validity")
-    parser.add_argument("--route", action="store_true", help="Route coverage")
-    parser.add_argument("--geometry", action="store_true", help="Geometric validity")
-    parser.add_argument("--scalability", action="store_true", help="Large-scale capability")
+    # --all is the only evaluation mode (kept for backward compatibility).
+    parser.add_argument("--all", action="store_true", help="Run all sections (default)")
     parser.add_argument("--regenerate", action="store_true", help="Regenerate graphs first")
     parser.add_argument(
         "--graph-method",
@@ -588,18 +302,15 @@ def main():
     parser.add_argument("--output", type=str, default=str(OUTPUT_DIR))
     args = parser.parse_args()
 
-    output_dir = Path(args.output)
+    output_dir = Path(args.output).resolve()
     vis_dir = Path(args.vis) if args.vis else None
     max_maps = args.max_maps if args.max_maps > 0 else 0  # 0 = all
     gm = args.graph_method
-    run_all = args.all or not (args.topology or args.route or args.geometry or args.scalability)
 
-    # In --all mode, always save visualizations
-    if run_all and vis_dir is None:
+    # The all-metrics binned evaluation is the only mode; always save visualizations.
+    run_all = True
+    if vis_dir is None:
         vis_dir = output_dir / "vis"
-
-    init_stats = get_resource_stats()
-    peak_stats = dict(init_stats)
 
     if args.regenerate or not GRAPH_PKL.exists():
         regenerate_graphs()
@@ -613,11 +324,11 @@ def main():
         if max_maps > 0:
             all_data = all_data[:max_maps]
 
-        target_bins = list(range(10, 81, 5))
+        target_bins = list(range(10, 61, 5))  # [10,15,...,60]
         bin_counts = {b: 0 for b in target_bins}
 
         def _bin(n):
-            return ((n - 1) // 5) * 5 + 5
+            return min((n // 5) * 5, 60)  # bins [10,15),[15,20),...,[55,60]; clamp at 60
 
         # ── Resume: load existing CSV ─────────────────────────────────────
         csv_path = output_dir / "all_metrics.csv"
@@ -637,7 +348,7 @@ def main():
             if key in seen_keys:
                 continue
 
-            if all(c >= 5 for c in bin_counts.values()):
+            if all(c >= 10 for c in bin_counts.values()):
                 break
             try:
                 G = dict_to_nx(entry, graph_method=gm, scale_to_meters=_HDMAPGEN_METER_SCALE)
@@ -648,13 +359,14 @@ def main():
             nb = _bin(G.number_of_nodes())
             if nb < target_bins[0]:  # skip small maps (bin 5)
                 continue
-            if nb in bin_counts and bin_counts[nb] >= 5:
+            if nb in bin_counts and bin_counts[nb] >= 10:
                 continue
 
             # Single resource monitoring block for all metric computation
             with monitor_resources(interval=0.3) as peaks:
                 topo = compute_topological_metrics(G, ref_avg_degree=ref_deg)
                 route = compute_route_coverage(G, n_pairs=100, seed=idx)
+                cycle = compute_cycle_ratio(G)
                 polylines = extract_polylines_from_subnodes(
                     entry, scale_to_meters=_HDMAPGEN_METER_SCALE
                 )
@@ -669,11 +381,12 @@ def main():
             row = {
                 "map_id": existing_count + len(per_map),
                 "pickle_idx": idx,
-                "scale": scale,
+                "node_bin": nb,
                 "n_nodes": topo["node_count"],
                 "n_edges": topo["edge_count"],
-                **{k: topo[k] for k in ("lcc", "dead_end_ratio", "avg_degree", "delta_avg_degree")},
-                **{k: route[k] for k in ("reachable_ratio", "avg_route_length")},
+                **{k: topo[k] for k in ("lcc", "dead_end_ratio", "avg_degree")},
+                **{k: route[k] for k in ("reachable_ratio",)},
+                **{k: cycle[k] for k in ("cycle_ratio",)},
                 **{
                     k: geo.get(k, "")
                     for k in (
@@ -681,7 +394,7 @@ def main():
                         "chamfer_loo_std",
                         "endpoint_alignment",
                         "mean_turning_angle_deg",
-                        "intersection_rate",
+                        "crossings_per_km",
                         "mean_edge_length",
                         "cv_edge_length",
                         "total_road_length",
@@ -702,7 +415,7 @@ def main():
                 bin_counts[nb] += 1
 
             if len(per_map) % 20 == 0:
-                filled = sum(1 for c in bin_counts.values() if c >= 5)
+                filled = sum(1 for c in bin_counts.values() if c >= 10)
                 print(
                     f"  [{existing_count + len(per_map)} maps] bins filled: {filled}/{len(target_bins)}"
                 )
@@ -720,27 +433,13 @@ def main():
                         ),
                     )
 
+        # ── Per-bin aggregate summary (all maps incl. resumed) ──
+        save_binned_summary(output_dir, "all_metrics", load_csv_rows(csv_path))
+
         gen_time = time.time() - t0
         n_total = existing_count + len(per_map)
         print(f"  Bin counts: {dict(bin_counts)}")
         print(f"  Processed {len(per_map)} new maps (→{n_total} total) in " f"{gen_time:.1f}s")
-        final_stats = get_resource_stats()
-        for k in peak_stats:
-            peak_stats[k] = max(peak_stats[k], final_stats[k])
-        save_system_info(output_dir, "HDMapGen", init_stats, peak_stats, n_total)
-    else:
-        if args.topology:
-            run_topology_eval(gm, output_dir, vis_dir=vis_dir, max_maps=max_maps)
-        if args.route:
-            run_route_eval(graph_method=gm, output_dir=output_dir, max_maps=max_maps)
-        if args.geometry:
-            run_geometry_eval(gm, output_dir, max_maps=max_maps)
-        if args.scalability:
-            run_scalability_eval(gm, output_dir, max_maps=max_maps)
-        final_stats = get_resource_stats()
-        for k in peak_stats:
-            peak_stats[k] = max(peak_stats[k], final_stats[k])
-        save_system_info(output_dir, "HDMapGen", init_stats, peak_stats, len(data))
 
     print(f"\n{'=' * 60}")
     print(f"HDMapGen evaluation complete — results in {output_dir}/")

@@ -6,6 +6,7 @@ import networkx as nx
 import numpy as np
 from shapely import simplify as shapely_simplify
 from shapely.geometry import LineString, Point, box
+from shapely.ops import nearest_points
 from shapely.strtree import STRtree
 
 from utils.geometry import segment_intersection as _segment_intersection
@@ -549,6 +550,98 @@ def merge_parallel_edges(coords, edge_index, geometries, map_size_m, angle_deg=3
     return coords, keep_ei, keep_geoms
 
 
+# ── Redundant chord removal ──────────────────────────────────────
+
+
+def remove_redundant_chords(
+    coords,
+    edge_index,
+    geometries,
+    map_size_m,
+    max_dist_m: float = 40.0,
+    detour_ratio: float = 0.10,
+    angle_deg: float = 20.0,
+):
+    """Remove a chord edge (u,v) that duplicates a two-edge path u-w-v.
+
+    A chord (u,v) is redundant when a common neighbour ``w`` (so a two-edge
+    path u-w-v exists) lies *on the same straight corridor* as the chord: near
+    the (u, v) geometry, the path adds negligible extra length, and both
+    segments stay near-collinear with the chord.  These three conditions are
+    checked together so that legitimate roads which merely pass near the chord
+    line (angled detours, genuine small blocks) are preserved.
+
+    Remove the chord and keep the subdivided path, so ``w`` (and any roads
+    branching from it) stay connected.  Existing parallel cleanup only compares
+    *non-adjacent* edge pairs, so a chord that shares an endpoint with both
+    path edges structurally escapes it.
+    """
+    if len(edge_index) < 3:
+        return coords, edge_index, geometries
+    dist_norm = max_dist_m / map_size_m
+    angle_rad = np.radians(angle_deg)
+
+    adj: dict[int, set[int]] = {i: set() for i in range(len(coords))}
+    for u, v in edge_index:
+        adj[int(u)].add(int(v))
+        adj[int(v)].add(int(u))
+
+    to_remove: set[int] = set()
+    for e, (u, v) in enumerate(edge_index):
+        u, v = int(u), int(v)
+        if u == v or e in to_remove:
+            continue
+        common = adj[u] & adj[v]
+        if not common:
+            continue
+        geom = (
+            np.asarray(geometries[e], dtype=float)
+            if e < len(geometries) and len(geometries[e]) >= 2
+            else np.array([coords[u], coords[v]])
+        )
+        line = LineString(geom)
+        chord_len = line.length
+        if chord_len < 1e-12:
+            continue
+        cu = np.asarray(coords[u], dtype=float)
+        cv = np.asarray(coords[v], dtype=float)
+        uv = cv - cu
+        vu = -uv
+        for w in common:
+            pw = np.asarray(coords[w], dtype=float)
+            if line.distance(Point(pw)) >= dist_norm:
+                continue
+            wu = pw - cu
+            wv = pw - cv
+            path_len = float(np.linalg.norm(wu)) + float(np.linalg.norm(wv))
+            if (path_len - chord_len) / chord_len >= detour_ratio:
+                continue
+            a1 = abs(np.degrees(np.arctan2(np.cross(uv, wu), np.dot(uv, wu))))
+            a2 = abs(np.degrees(np.arctan2(np.cross(vu, wv), np.dot(vu, wv))))
+            if max(a1, a2) >= angle_deg:
+                continue
+            to_remove.add(e)
+            break
+
+    if not to_remove:
+        return coords, edge_index, geometries
+
+    print(f"  [Chord] {len(to_remove)} redundant chords removed")
+    keep_idx = [j for j in range(len(edge_index)) if j not in to_remove]
+    keep_ei = edge_index[keep_idx]
+    keep_geoms = [geometries[j] for j in keep_idx]
+
+    # Drop nodes orphaned by the removals (chord endpoints stay connected via w).
+    G = build_nx(coords, keep_ei)
+    orphaned = [n for n in range(len(coords)) if G.degree(n) == 0]
+    if orphaned:
+        c = np.delete(coords, orphaned, axis=0)
+        remap = {n: k for k, n in enumerate(n for n in range(len(coords)) if n not in orphaned)}
+        keep_ei = np.array([[remap[int(u)], remap[int(v)]] for u, v in keep_ei], dtype=np.int64)
+        return c, keep_ei, keep_geoms
+    return coords.copy(), keep_ei, keep_geoms
+
+
 # ── Snap edges to nearby nodes ────────────────────────────────────
 
 
@@ -726,3 +819,191 @@ def align_geometries_to_nodes(coords, edge_index, geometries):
     if changes:
         print(f"[AlignGeom] {changes}/{len(edge_index)} geometries fixed")
     return geometries
+
+
+# ── Merge near-miss edges into intersections ──────────────────────
+
+
+def merge_near_miss_edges(
+    coords, edge_index, geometries, map_size_m, near_dist_m=15.0, angle_deg=30.0
+):
+    """Merge non-adjacent edges that pass close to each other (near-misses).
+
+    Two edges that do not share a node but whose geometries come within
+    ``near_dist_m`` of each other far from any node never intersect
+    topologically, yet their lane envelopes overlap once lanes are widened.
+    ``fix_edge_crossings`` only catches exact crossings, ``merge_parallel_edges``
+    only catches near-parallel pairs, and ``snap_edges_to_nodes`` only catches
+    edge-vs-node proximity.  This step closes the gap: it splits both edges at
+    their closest-approach point and merges the two new nodes into one shared
+    junction, so the roads properly intersect.
+
+    Near-parallel pairs (angle within ``angle_deg`` of collinear) are left to
+    ``merge_parallel_edges``, which removes the shorter duplicate road.
+    """
+    if len(edge_index) < 2:
+        return coords, edge_index, geometries
+    near_norm = near_dist_m / map_size_m
+
+    c = [np.asarray(p, dtype=float) for p in coords]
+    ei = [(int(u), int(v)) for u, v in edge_index]
+    geoms = [np.asarray(g, dtype=float) for g in geometries]
+
+    def _line(idx):
+        g = geoms[idx]
+        if len(g) >= 2:
+            return LineString(g)
+        u, v = ei[idx]
+        return LineString([c[u], c[v]])
+
+    lines = [_line(i) for i in range(len(ei))]
+    tree = STRtree(lines)
+
+    angle_rad = np.radians(angle_deg)
+
+    # Two resolutions for a near-miss:
+    #   crossing-like (angle between angle_deg and 180-angle_deg) -> the two
+    #     roads visually cross, so give them a shared intersection node.
+    #   near-parallel (angle within angle_deg of collinear)          -> the two
+    #     roads are a duplicated corridor, so merge them by keeping the longer.
+    junction_pairs: list[tuple[int, int, float, float, np.ndarray]] = []
+    remove_set: set[int] = set()
+
+    for i in range(len(ei)):
+        if i in remove_set:
+            continue
+        u1, v1 = ei[i]
+        for j in tree.query(lines[i]):
+            j = int(j)
+            if j <= i or j in remove_set:
+                continue
+            u2, v2 = ei[j]
+            if len({u1, v1} & {u2, v2}) > 0:
+                continue
+            ls_i, ls_j = lines[i], lines[j]
+            if ls_i.length < 1e-9 or ls_j.length < 1e-9:
+                continue
+            if ls_i.distance(ls_j) > near_norm:
+                continue
+            d1 = np.asarray(c[v1], dtype=float) - np.asarray(c[u1], dtype=float)
+            d2 = np.asarray(c[v2], dtype=float) - np.asarray(c[u2], dtype=float)
+            n1, n2 = float(np.linalg.norm(d1)), float(np.linalg.norm(d2))
+            if n1 < 1e-12 or n2 < 1e-12:
+                continue
+            ang = abs(np.arccos(np.clip(float(np.dot(d1 / n1, d2 / n2)), -1, 1)))
+            if angle_rad < ang < np.pi - angle_rad:
+                # Crossing-like: split both edges and merge into a shared node.
+                p_i, p_j = nearest_points(ls_i, ls_j)
+                f_i = ls_i.project(p_i) / ls_i.length
+                f_j = ls_j.project(p_j) / ls_j.length
+                if f_i < 0.05 or f_i > 0.95 or f_j < 0.05 or f_j > 0.95:
+                    continue  # too close to an endpoint — already a node
+                mid = np.array([(p_i.x + p_j.x) / 2, (p_i.y + p_j.y) / 2])
+                junction_pairs.append((i, j, f_i, f_j, mid))
+            else:
+                # Near-parallel duplicated corridor: keep the longer road.
+                remove_set.add(i if ls_i.length >= ls_j.length else j)
+
+    if not junction_pairs and not remove_set:
+        return coords, edge_index, geometries
+
+    # One shared junction node per crossing-like near-miss pair.
+    node_of_mid: dict[tuple, int] = {}
+    new_nodes: list[np.ndarray] = []
+
+    def _node(mid):
+        key = tuple(np.round(mid, 6))
+        if key in node_of_mid:
+            return node_of_mid[key]
+        nid = len(c) + len(new_nodes)
+        node_of_mid[key] = nid
+        new_nodes.append(mid)
+        return nid
+
+    # edge idx -> list of (frac, node_id, node_pos)
+    splits: dict[int, list[tuple[float, int, np.ndarray]]] = {}
+    for i, j, f_i, f_j, mid in junction_pairs:
+        nid = _node(mid)
+        if i not in remove_set:
+            splits.setdefault(i, []).append((f_i, nid, mid))
+        if j not in remove_set:
+            splits.setdefault(j, []).append((f_j, nid, mid))
+
+    # Rebuild edges, splitting each at its cut points (mirrors fix_edge_crossings).
+    out_c = list(c)
+    out_ei: list[tuple[int, int]] = []
+    out_geoms: list[np.ndarray] = []
+
+    for idx in range(len(ei)):
+        if idx in remove_set:
+            continue
+        u, v = ei[idx]
+        if idx not in splits:
+            out_ei.append((u, v))
+            out_geoms.append(geoms[idx])
+            continue
+        g = geoms[idx]
+        if len(g) < 2:
+            g = np.array([c[u], c[v]])
+        seg_len = np.sqrt(((g[1:] - g[:-1]) ** 2).sum(axis=1))
+        cum = np.concatenate([[0], np.cumsum(seg_len)])
+        total = float(cum[-1])
+        if total < 1e-12:
+            out_ei.append((u, v))
+            out_geoms.append(g)
+            continue
+
+        cuts = sorted(splits[idx], key=lambda x: x[0])
+        deduped: list[tuple[float, int, np.ndarray]] = []
+        for f, nid, pos in cuts:
+            if not deduped or f - deduped[-1][0] > 1e-4:
+                deduped.append((f, nid, pos))
+
+        prev_node = u
+        prev_pt = np.asarray(c[u], dtype=float)
+        prev_cum = 0.0
+        for f, nid, pos in deduped:
+            target_cum = f * total
+            sub_pts = [prev_pt.copy()]
+            for k in range(1, len(g)):
+                if cum[k] <= prev_cum + 1e-12:
+                    continue
+                if cum[k - 1] >= target_cum - 1e-12:
+                    break
+                seg_start = max(prev_cum, cum[k - 1])
+                seg_end = min(target_cum, cum[k])
+                if seg_end <= seg_start:
+                    continue
+                t = (seg_start - cum[k - 1]) / (cum[k] - cum[k - 1] + 1e-12)
+                sub_pts.append(g[k - 1] + t * (g[k] - g[k - 1]))
+            sub_pts.append(pos)
+            out_ei.append((prev_node, nid))
+            out_geoms.append(np.array(sub_pts))
+            prev_node = nid
+            prev_pt = pos
+            prev_cum = target_cum
+
+        sub_pts = [prev_pt.copy()]
+        for k in range(1, len(g)):
+            if cum[k] <= prev_cum + 1e-12:
+                continue
+            t = (max(prev_cum, cum[k - 1]) - cum[k - 1]) / (cum[k] - cum[k - 1] + 1e-12)
+            sub_pts.append(g[k - 1] + t * (g[k] - g[k - 1]))
+        if len(sub_pts) >= 2:
+            out_ei.append((prev_node, v))
+            out_geoms.append(np.array(sub_pts))
+
+    out_c = out_c + new_nodes
+
+    # Drop nodes orphaned by edge removal and re-index.
+    used = {a for a, b in out_ei} | {b for a, b in out_ei}
+    old = sorted(used)
+    remap = {n: k for k, n in enumerate(old)}
+    out_c = np.array([out_c[n] for n in old], dtype=float)
+    out_ei = np.array([[remap[a], remap[b]] for a, b in out_ei], dtype=np.int64)
+
+    print(
+        f"  [NearMiss] {len(junction_pairs)} crossing near-misses -> junctions, "
+        f"{len(remove_set)} parallel duplicates removed"
+    )
+    return out_c, out_ei, out_geoms

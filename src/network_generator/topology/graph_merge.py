@@ -208,11 +208,28 @@ def merge_close_nodes(
                 new_coords_list.append(np.mean([coords[n] for n in cl], axis=0))
                 new_types_list.append(NT_WAYPOINT)
         else:
-            cid = len(new_coords_list)
-            for n in cl:
-                old2new[n] = cid
-            new_coords_list.append(np.mean([coords[n] for n in cl], axis=0))
-            new_types_list.append(NT_WAYPOINT)
+            # All-waypoint cluster: merge only when nearly collinear.  A bend
+            # (large perpendicular deviation from the chord) must be kept,
+            # otherwise merging flattens the curve into a straight chord.
+            pts = np.array([coords[n] for n in cl])
+            v = pts[-1] - pts[0]
+            vn = float(np.linalg.norm(v))
+            if vn < 1e-6:
+                merge = True  # duplicate points
+            else:
+                dev = max(float(np.linalg.norm(np.cross(v, p - pts[0]))) / vn for p in pts)
+                merge = dev < 0.10 * vn
+            if merge:
+                cid = len(new_coords_list)
+                for n in cl:
+                    old2new[n] = cid
+                new_coords_list.append(np.mean([coords[n] for n in cl], axis=0))
+                new_types_list.append(NT_WAYPOINT)
+            else:
+                for n in cl:
+                    old2new[n] = len(new_coords_list)
+                    new_coords_list.append(coords[n])
+                    new_types_list.append(int(node_types[n]))
 
     merged_coords = np.array(new_coords_list, dtype=np.float32)
     merged_types = np.array(new_types_list, dtype=np.int64)

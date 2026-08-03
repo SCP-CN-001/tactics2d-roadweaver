@@ -1,0 +1,51 @@
+# RoadWeaver generation pipeline parameters
+# Values here override function defaults at load time.
+# See src/generate_graph.py::load_pipeline_config()
+
+# === Growth graph cleanup (operates on raw growth output) ===
+growth_prune_chain_m: 120.0        # prune_dead_ends max chain length (m)
+growth_snap_dist_m: 50.0           # snap_endpoints distance (m)
+growth_angle_clean_deg: 15.0       # clean_sharp_angles threshold (deg)
+growth_merge_dist_m: 30.0          # merge_close_nodes distance (m)
+growth_parallel_angle_deg: 20.0    # clean_growth_parallels angle (deg)
+growth_parallel_dist_m: 25.0       # clean_growth_parallels distance (m)
+
+# === GrowthConfig style-aware overrides ===
+g1_branch_p: 0.04                  # G1 branch probability
+grid_cuts: 15                      # G2 max cuts (grid style)
+organic_cuts: 20                   # G2 max cuts (organic style)
+local_spacing_m: 80.0              # target road spacing (m)
+grid_jitter_deg: 5.0               # G2 jitter for grid style
+grid_seed_jitter: 0.15             # G1 seed jitter for grid style
+grid_step_jitter_deg: 2.0          # per-step jitter for grid style
+organic_jitter_deg: 35.0           # G2 jitter for organic style
+organic_seed_jitter: 0.35          # G1 seed jitter for organic style
+organic_step_jitter_deg: 8.0       # per-step jitter for organic style
+
+# === Compressed graph cleanup ===
+merge_dist_m: 60.0                 # merge_compressed_graph distance (m)
+snap_dist_m: 15.0                  # snap_edges_to_nodes first pass (m)
+snap_dist_m_final: 8.0             # snap_edges_to_nodes final pass (m)
+merge_junction_dist_m: 60.0        # merge_nearby_junctions + classify degroup (m)
+split_radius_m: 3.0                # split_high_degree_junctions offset (m)
+parallel_angle_deg: 30.0           # merge_parallel_edges / clean_parallel_roads (deg)
+parallel_dist_m: 40.0              # merge_parallel_edges / clean_parallel_roads (m)
+chord_dup_dist_m: 40.0             # remove_redundant_chords chord-to-path corridor distance (m)
+chord_detour_ratio: 0.10           # remove_redundant_chords max path/chord extra length ratio
+chord_angle_deg: 20.0              # remove_redundant_chords max path-to-chord deviation (deg)
+
+# === Skeleton generation (generate_skeleton) ===
+endpoint_max_connections: 30       # EndpointConnector max connections
+endpoint_max_remaining_m: 600      # EndpointConnector max remaining (m)
+simplify_angle_deg: 15             # simplify_chains angle threshold (deg)
+simplify_dp_epsilon: 0.002         # simplify_chains DP epsilon (normalized)
+merge_spacing_ratio: 0.25          # merge_close_nodes formula multiplier
+
+# === Lane assignment (assign_lanes) ===
+lane_long_edge_m: 400              # edge length > this → +1 lane (m)
+lane_short_edge_m: 80              # edge length < this → -1 lane (m)
+lane_high_importance: 8            # node importance >= this → +1 lane
+lane_high_density: 25              # density > this → +1 lane
+
+# === Misc ===
+chaikin_iterations: 2              # Chaikin smoothing passes

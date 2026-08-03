@@ -9,6 +9,7 @@ from shapely.geometry import LineString, Polygon
 
 from tactics2d.map.element import Lane, LaneRelationship, Map
 from tactics2d.map.generator.road_segment.intersection import Intersection
+from tactics2d.map.generator.road_segment.junction_approach import JunctionApproach
 from tactics2d.map.generator.road_segment.roundabout import Roundabout
 from utils.geometry import segment_intersection as _segment_intersection
 
@@ -24,7 +25,166 @@ from .geometry import (
 
 LANE_WIDTH_M = 3.5
 _SPEED_BY_RC = {1: 80, 2: 60, 3: 50}
-_INTERSECTION_RADIUS = 5.0
+_INTERSECTION_RADIUS = 8.0
+_RA_RING_RADIUS = 18.0
+_APPROACH_LENGTH = 20.0
+
+
+def _coarsen(pts: np.ndarray, max_pts: int = 64) -> np.ndarray:
+    """Subsample a polyline to at most ``max_pts`` points (keeps both ends)."""
+    if len(pts) <= max_pts:
+        return pts
+    idx = np.unique(np.linspace(0, len(pts) - 1, max_pts).astype(int))
+    return pts[idx]
+
+
+def _repair_hourglass_lane(lane, tol: float = 0.05, max_iter: int = 3) -> bool:
+    """Truncate a lane's boundaries at their first crossing, in place.
+
+    Returns True if the lane is valid afterwards (possibly shortened); False if
+    it is too degenerate to keep.  Both boundaries are cut at the smaller of the
+    two crossing arc fractions, then re-checked (a crossing can reappear after a
+    first cut), up to ``max_iter`` times.  The crossing search runs on a
+    coarsened copy of the boundaries (they can carry hundreds of points after
+    smoothing); the cut itself uses the full-resolution boundaries.
+    """
+    for _ in range(max_iter):
+        lt, rt = lane.left_side, lane.right_side
+        if lt is None or rt is None or lt.is_empty or rt.is_empty:
+            return True
+        lta = np.array(list(lt.coords))
+        rta = np.array(list(rt.coords))
+        if len(lta) < 2 or len(rta) < 2:
+            return False
+        poly = Polygon(np.vstack([lta, rta[::-1]]))
+        if poly.is_simple and poly.is_valid:
+            return True
+
+        ls, rs = LineString(_coarsen(lta)), LineString(_coarsen(rta))
+        f_lefts: list[float] = []
+        f_rights: list[float] = []
+        inter = ls.intersection(rs)
+        if not inter.is_empty:
+            pts = list(inter.geoms) if inter.geom_type == "MultiPoint" else [inter]
+            for p in pts:
+                if p.geom_type != "Point":
+                    continue
+                if ls.length < 1e-12 or rs.length < 1e-12:
+                    continue
+                f_l = float(ls.project(p) / ls.length)
+                f_r = float(rs.project(p) / rs.length)
+                if tol < f_l < 1 - tol and tol < f_r < 1 - tol:
+                    f_lefts.append(f_l)
+                    f_rights.append(f_r)
+        # Single-boundary self-intersections (folded road) are cut the same way.
+        for arr in (_coarsen(lta), _coarsen(rta)):
+            if len(arr) >= 4 and not LineString(arr).is_simple:
+                fs = self_intersection_frac(arr)
+                if fs is not None and tol < fs < 1 - tol:
+                    f_lefts.append(fs)
+                    f_rights.append(fs)
+        if not f_lefts:
+            return False
+        f = min(min(f_lefts), min(f_rights))
+        lt2 = truncate_at_frac(lta, f)
+        rt2 = truncate_at_frac(rta, f)
+        if len(lt2) < 2 or len(rt2) < 2:
+            return False
+        lane.left_side = LineString(lt2)
+        lane.right_side = LineString(rt2)
+    # Final verification after max_iter cuts.
+    lt, rt = lane.left_side, lane.right_side
+    lta = np.array(list(lt.coords))
+    rta = np.array(list(rt.coords))
+    return (
+        Polygon(np.vstack([lta, rta[::-1]])).is_simple
+        and Polygon(np.vstack([lta, rta[::-1]])).is_valid
+    )
+
+
+def _trim_taper_lane(lane, min_width: float = 1.5) -> None:
+    """Trim the near-zero-width tip of a taper lane, in place.
+
+    Junction-approach "added"/"dropped" lanes taper from full width to zero,
+    so one end converges to a point ("收束到一点").  The tip narrower than
+    ``min_width`` is cut off, leaving a blunt end — the lane keeps its width
+    and no longer pinches to a visible point.  Lanes already >= ``min_width``
+    at both ends are left untouched.
+    """
+    lt, rt = lane.left_side, lane.right_side
+    if lt is None or rt is None or lt.is_empty or rt.is_empty:
+        return
+    lta = np.array(list(lt.coords))
+    rta = np.array(list(rt.coords))
+    n = min(len(lta), len(rta))
+    if n < 3:
+        return
+    w = np.linalg.norm(lta[:n] - rta[:n], axis=1)
+    if w[0] >= min_width and w[-1] >= min_width:
+        return
+    keep = np.where(w >= min_width)[0]
+    if len(keep) == 0:
+        return
+    i0 = int(keep[0])
+    i1 = int(keep[-1])
+    if w[0] < min_width and w[-1] < min_width:
+        # narrow at both ends ("lens" lane) -> keep the wide middle
+        lane.left_side = LineString(lta[i0 : i1 + 1])
+        lane.right_side = LineString(rta[i0 : i1 + 1])
+    elif w[0] < min_width:
+        # narrow at the start (road side, "added" lane) -> trim the tip
+        lane.left_side = LineString(lta[i0:])
+        lane.right_side = LineString(rta[i0:])
+    else:
+        # narrow at the end (junction side, "dropped" lane) -> trim the tip
+        lane.left_side = LineString(lta[: i1 + 1])
+        lane.right_side = LineString(rta[: i1 + 1])
+
+
+def _monotonic_desc(vals):
+    """Enforce strictly monotonic decreasing lateral boundary offsets.
+
+    A junction port exposes one connector lane per *turn* (straight plus
+    left/right from every other arm), so the port boundary positions along an
+    arm cross-section can overlap and reverse order.  Feeding non-monotonic
+    offsets into the approach taper makes adjacent lane boundaries cross — the
+    hourglass shape.  Clamping to a strictly decreasing fan keeps the approach
+    lanes well ordered and crossing-free.
+    """
+    out = []
+    for v in vals:
+        out.append(v if not out else min(float(v), out[-1] - 1e-3))
+    return out
+
+
+def _approach_tail(road_pts: np.ndarray, pt: np.ndarray, max_len: float) -> np.ndarray:
+    """Return road points within ``max_len`` of the port point ``pt``.
+
+    The approach lane must only bridge a short distance from the junction
+    port into the road.  Capping by *distance* (instead of taking a fixed
+    number of geometry points) prevents approach lanes from retracing the
+    road geometry for hundreds of metres and painting ghost lanes on top of
+    the road lanes.  Points are returned in the same order as ``road_pts``.
+    """
+    road_pts = np.asarray(road_pts, dtype=float)
+    if len(road_pts) < 2:
+        return road_pts
+    d0 = float(np.linalg.norm(road_pts[0] - pt))
+    d1 = float(np.linalg.norm(road_pts[-1] - pt))
+    start = 0 if d0 <= d1 else len(road_pts) - 1
+    step = 1 if start == 0 else -1
+    idxs = [start]
+    acc = 0.0
+    k = start
+    while 0 <= k + step < len(road_pts):
+        nxt = k + step
+        acc += float(np.linalg.norm(road_pts[nxt] - road_pts[k]))
+        if acc > max_len:
+            break
+        idxs.append(nxt)
+        k = nxt
+    idxs.sort()
+    return road_pts[idxs]
 
 
 def assign_lanes(
@@ -222,16 +382,19 @@ def graph_to_map(
         if v_is_junc:
             centre = c[v]
             h = heading(pts, at_end=True) + np.pi  # inward
-            arm_pt = centre + _INTERSECTION_RADIUS * np.array(
-                [np.cos(h + np.pi), np.sin(h + np.pi)]
-            )
             for k in range(len(pts) - 1, -1, -1):
                 if np.linalg.norm(pts[k] - centre) >= _INTERSECTION_RADIUS:
                     clipped = list(pts[: k + 1])
                     dir_to_centre = centre - clipped[-1]
                     dir_to_centre = dir_to_centre / (np.linalg.norm(dir_to_centre) + 1e-12)
-                    clipped[-1] = centre - _INTERSECTION_RADIUS * dir_to_centre
-                    geoms_road[e] = np.array(clipped)
+                    clipped_end = centre - _INTERSECTION_RADIUS * dir_to_centre
+                    if len(clipped) == 1:
+                        # straight 2-point edge: keep the far endpoint too,
+                        # otherwise the geometry collapses to a single point
+                        geoms_road[e] = np.array([clipped[0], clipped_end])
+                    else:
+                        clipped[-1] = clipped_end
+                        geoms_road[e] = np.array(clipped)
                     break
 
         # Departing from u (edge starts at junction u)
@@ -239,14 +402,18 @@ def graph_to_map(
         if len(pts) >= 2 and u_is_junc:
             centre = c[u]
             h = heading(pts, at_end=False)  # outward
-            arm_pt = centre + _INTERSECTION_RADIUS * np.array([np.cos(h), np.sin(h)])
             for k in range(len(pts)):
                 if np.linalg.norm(pts[k] - centre) >= _INTERSECTION_RADIUS:
                     clipped = list(pts[k:])
                     dir_from_centre = clipped[0] - centre
                     dir_from_centre = dir_from_centre / (np.linalg.norm(dir_from_centre) + 1e-12)
-                    clipped[0] = centre + _INTERSECTION_RADIUS * dir_from_centre
-                    geoms_road[e] = np.array(clipped)
+                    clipped_start = centre + _INTERSECTION_RADIUS * dir_from_centre
+                    if len(clipped) == 1:
+                        # straight 2-point edge: keep the far endpoint too
+                        geoms_road[e] = np.array([clipped_start, clipped[0]])
+                    else:
+                        clipped[0] = clipped_start
+                        geoms_road[e] = np.array(clipped)
                     break
 
     # ---- Build road lanes (shared-boundary computation) --------------
@@ -264,13 +431,6 @@ def graph_to_map(
     # b[n_l+1]      +W              bwd[n_l].right = bwd[n_l+1].left
     #  ...           ...             ...
     # b[2·n_l]      +n_l*W          bwd[2·n_l-1].right
-    #
-    # We save the shared boundary arrays in _edge_bounds so that port
-    # matching can modify them directly; after all modifications we call
-    # _rebuild_lane_linestrings() to recreate the Lane geometry from the
-    # (possibly modified) shared arrays.
-    _edge_bounds: dict[int, list[np.ndarray | None]] = {}
-
     for e in range(n_edges):
         u, v = int(ei[e, 0]), int(ei[e, 1])
         n_lanes = max(1, int(lanes_per_dir[e]))
@@ -332,6 +492,12 @@ def graph_to_map(
                 boundaries[k] = offset_per_point(pts, d)
                 if boundaries[k] is not None and len(boundaries[k]) >= 3:
                     boundaries[k] = chaikin(boundaries[k], iterations=2)
+                # Recompute produces a full-length boundary while the others
+                # were truncated at min_cut; re-apply the same cut so shared
+                # boundary endpoints stay aligned (avoids a width collapse at
+                # the truncation point).
+                if boundaries[k] is not None and min_cut < 1.0:
+                    boundaries[k] = truncate_at_frac(boundaries[k], min_cut)
 
         # --- Realign endpoints perpendicular to centreline -------------
         # Only the first and last point of each boundary is adjusted;
@@ -370,9 +536,6 @@ def graph_to_map(
             for k in range(n_b):
                 if boundaries[k] is not None:
                     boundaries[k] = truncate_at_frac(boundaries[k], min_cut2)
-
-        # Save shared boundaries for later modification by port matching
-        _edge_bounds[e] = boundaries
 
         # --- Build lanes from shared boundaries ------------------------
         for i in range(n_lanes * 2):
@@ -468,9 +631,12 @@ def graph_to_map(
                 _ra_arm_edges.append(e)
                 _ra_arm_incoming.append(e in node_in[n])
         if len(arms) >= 2:
+            # Ring lane count follows the widest approach arm, so every
+            # approach lane gets its own ring lane (pair_num = min(arm, ring)).
+            ring_lanes = max(1, max(int(arm["lane_num"]) for arm in arms))
             ra = Roundabout(
-                ring_radius=_INTERSECTION_RADIUS * 3,
-                ring_lane_num=1,
+                ring_radius=_RA_RING_RADIUS,
+                ring_lane_num=ring_lanes,
                 lane_width=LANE_WIDTH_M,
                 speed_limit=20.0,
             )
@@ -540,30 +706,103 @@ def graph_to_map(
                         continue
                 candidates.sort(key=lambda x: x[1])
 
-                if is_in:
-                    # Approach: every approaching road lane gets a connector as
-                    # successor (a connector may accept several road lanes), so
-                    # no road lane is left dangling and successor chains do not
-                    # break at the roundabout.
-                    n_conn = len(port_lanes)
-                    if n_conn and candidates:
-                        for k in range(len(candidates)):
-                            lid, _ = candidates[k]
-                            rid, _lat, _lt, _rt = port_lanes[k % n_conn]
-                            _link(lid, rid)
-                        # NOTE: boundary snap removed.  The roundabout polygon
-                        # covers the junction area; shared-boundary lane
-                        # building already guarantees lane bodies are gap-free.
+                n_port_lanes = len(port_lanes)
+                # ---- Build JunctionApproach for roundabout arm ----
+                bdy_offsets = []
+                for pi, (_, _, _lt, _rt) in enumerate(port_lanes):
+                    llat = float(np.dot(_lt - pt, perp))
+                    rlat = float(np.dot(_rt - pt, perp))
+                    if pi == 0:
+                        bdy_offsets.append(llat)
+                    bdy_offsets.append(rlat)
+                bdy_offsets = _monotonic_desc(bdy_offsets)
+
+                # Road geometry near the roundabout: find the index where
+                # distance from centre crosses _trunc_radius, then take a
+                # tail of points on the road side to preserve the curve.
+                _ra_pts = geom(edge_id, geoms_road, c, ei)
+                _trunc_radius = _INTERSECTION_RADIUS + _APPROACH_LENGTH
+                _incoming = _ra_arm_incoming[arm_idx]
+                _N_TAIL = min(8, len(_ra_pts))
+                _cut_idx = None
+                if _incoming:
+                    for _k in range(len(_ra_pts) - 1, -1, -1):
+                        if np.linalg.norm(_ra_pts[_k] - centre) >= _trunc_radius:
+                            _cut_idx = _k
+                            break
+                    if _cut_idx is not None:
+                        _tail = _ra_pts[max(0, _cut_idx - _N_TAIL + 1) : _cut_idx + 1]
+                    else:
+                        _tail = _ra_pts[:_N_TAIL]
                 else:
-                    # Depart: every connector ending at this arm gets the depart
-                    # road as its successor (a road lane accepts traffic from
-                    # several connectors), so no connector is left dangling.
-                    n_depart = len(candidates)
-                    if n_depart and port_lanes:
-                        for k in range(len(port_lanes)):
-                            rid, _lat, _lt, _rt = port_lanes[k]
-                            lid, _ = candidates[k % n_depart]
-                            _link(rid, lid)
+                    for _k in range(len(_ra_pts)):
+                        if np.linalg.norm(_ra_pts[_k] - centre) >= _trunc_radius:
+                            _cut_idx = _k
+                            break
+                    if _cut_idx is not None:
+                        _tail = _ra_pts[_cut_idx : _cut_idx + _N_TAIL]
+                    else:
+                        _tail = _ra_pts[-_N_TAIL:]
+
+                # Reverse when travelling away from junction along the road
+                if is_in != _incoming:
+                    _tail = _tail[::-1]
+
+                if is_in:
+                    cl = np.vstack([_tail, pt.reshape(1, 2)])
+                    app_start_n, app_end_n = n_lanes, n_port_lanes
+                else:
+                    cl = np.vstack([pt.reshape(1, 2), _tail])
+                    app_start_n, app_end_n = n_port_lanes, n_lanes
+
+                cl = smooth(cl)
+
+                try:
+                    app = JunctionApproach(step_size=0.1)
+                    app_res = app.build(
+                        centerline=cl,
+                        start_lane_num=app_start_n,
+                        end_lane_num=app_end_n,
+                        end_boundary_offsets=np.array(bdy_offsets),
+                        lane_width=LANE_WIDTH_M,
+                        speed_limit=20.0,
+                        id_offset=id_counter,
+                    )
+                    id_counter = app_res.id_counter
+
+                    for aln in app_res.lanes:
+                        alid = f"app_{aln.id_}"
+                        all_lanes[alid] = aln
+                        aln.id_ = alid
+
+                    entry_ids = [f"app_{lid}" for lid in app_res.ports["entry"].lane_ids]
+                    exit_ids = [f"app_{lid}" for lid in app_res.ports["exit"].lane_ids]
+
+                    if is_in:
+                        for i in range(min(len(entry_ids), len(candidates))):
+                            _link(candidates[i][0], entry_ids[i])
+                        for j in range(min(len(exit_ids), n_port_lanes)):
+                            _link(exit_ids[j], port_lanes[j][0])
+                    else:
+                        for j in range(min(len(entry_ids), n_port_lanes)):
+                            _link(port_lanes[j][0], entry_ids[j])
+                        for i in range(min(len(exit_ids), len(candidates))):
+                            _link(exit_ids[i], candidates[i][0])
+                except Exception:
+                    if is_in:
+                        n_conn = len(port_lanes)
+                        if n_conn and candidates:
+                            for k in range(len(candidates)):
+                                lid, _ = candidates[k]
+                                rid, _, _, _ = port_lanes[k % n_conn]
+                                _link(lid, rid)
+                    else:
+                        n_depart = len(candidates)
+                        if n_depart and port_lanes:
+                            for k in range(len(port_lanes)):
+                                rid, _, _, _ = port_lanes[k]
+                                lid, _ = candidates[k % n_depart]
+                                _link(rid, lid)
 
     # ---- Individual intersection nodes (non-RA) -----------------------
     for n in range(len(c)):
@@ -665,41 +904,85 @@ def graph_to_map(
                             continue
                     candidates.sort(key=lambda x: x[1])
 
+                    n_port_lanes = len(port_lanes)
+                    # ---- Build JunctionApproach -----------------
+                    bdy_offsets = []
+                    for pi, (_, _, _lt, _rt) in enumerate(port_lanes):
+                        llat = float(np.dot(_lt - pt, perp))
+                        rlat = float(np.dot(_rt - pt, perp))
+                        if pi == 0:
+                            bdy_offsets.append(llat)
+                        bdy_offsets.append(rlat)
+                    bdy_offsets = _monotonic_desc(bdy_offsets)
+
+                    # Road geometry near this junction node.  Cap the tail by a
+                    # fixed distance from the port (not a fixed point count),
+                    # so approach lanes only bridge the junction zone instead of
+                    # retracing the road for hundreds of metres.
+                    _road_pts = geoms_road[edge_id]
+                    _tail = _approach_tail(_road_pts, pt, _APPROACH_LENGTH)
+                    # Reverse when going away from junction along the road
+                    if is_in != edge_is_incoming:
+                        _tail = _tail[::-1]
+
                     if is_in:
-                        # Approach: match road lanes to the STRAIGHT connectors
-                        # (which continue the road) first, so a through road does
-                        # not veer sideways into a turn lane near the junction.
-                        # Extra road lanes fall back to turn connectors.
-                        straight = [
-                            pl
-                            for pl in port_lanes
-                            if all_lanes[pl[0]].custom_tags.get("turn") == "straight"
-                        ]
-                        turns = [
-                            pl
-                            for pl in port_lanes
-                            if all_lanes[pl[0]].custom_tags.get("turn") != "straight"
-                        ]
-                        primary = straight if straight else port_lanes
-                        if primary and candidates:
-                            for k in range(len(candidates)):
-                                lid, _ = candidates[k]
-                                iid = primary[k % len(primary)][0]
-                                _link(lid, iid)
-                            # NOTE: centreline boundary snap removed.
-                            # Shared-boundary lane building guarantees forward
-                            # and backward innermost lanes share identical
-                            # centreline endpoints; no per-lane snap needed.
+                        cl = np.vstack([_tail, pt.reshape(1, 2)])
+                        app_start_n, app_end_n = n_lanes, n_port_lanes
                     else:
-                        # Depart: every connector ending at this arm gets the depart
-                        # road as its successor (a road lane accepts traffic from
-                        # several connectors), so no connector is left dangling.
-                        n_depart = len(candidates)
-                        if n_depart and port_lanes:
-                            for k in range(len(port_lanes)):
-                                iid, _lat, _lt, _rt = port_lanes[k]
-                                lid, _ = candidates[k % n_depart]
-                                _link(iid, lid)
+                        cl = np.vstack([pt.reshape(1, 2), _tail])
+                        app_start_n, app_end_n = n_port_lanes, n_lanes
+
+                    cl = smooth(cl)
+
+                    try:
+                        app = JunctionApproach(step_size=0.1)
+                        app_res = app.build(
+                            centerline=cl,
+                            start_lane_num=app_start_n,
+                            end_lane_num=app_end_n,
+                            end_boundary_offsets=np.array(bdy_offsets),
+                            lane_width=LANE_WIDTH_M,
+                            speed_limit=30.0,
+                            id_offset=id_counter,
+                        )
+                        id_counter = app_res.id_counter
+
+                        app_lanes = []
+                        for aln in app_res.lanes:
+                            alid = f"app_{aln.id_}"
+                            all_lanes[alid] = aln
+                            aln.id_ = alid
+                            app_lanes.append(alid)
+
+                        entry_ids = [f"app_{lid}" for lid in app_res.ports["entry"].lane_ids]
+                        exit_ids = [f"app_{lid}" for lid in app_res.ports["exit"].lane_ids]
+
+                        if is_in:
+                            # road → approach entry → approach exit → connector
+                            for i in range(min(len(entry_ids), len(candidates))):
+                                _link(candidates[i][0], entry_ids[i])
+                            for j in range(min(len(exit_ids), n_port_lanes)):
+                                _link(exit_ids[j], port_lanes[j][0])
+                        else:
+                            # connector → approach entry → approach exit → road
+                            for j in range(min(len(entry_ids), n_port_lanes)):
+                                _link(port_lanes[j][0], entry_ids[j])
+                            for i in range(min(len(exit_ids), len(candidates))):
+                                _link(exit_ids[i], candidates[i][0])
+                    except Exception:
+                        # Fallback: direct link
+                        if is_in:
+                            if port_lanes and candidates:
+                                for k in range(len(candidates)):
+                                    lid, _ = candidates[k]
+                                    iid = port_lanes[k % n_port_lanes][0]
+                                    _link(lid, iid)
+                        else:
+                            if candidates and port_lanes:
+                                for k in range(len(port_lanes)):
+                                    iid, _, _, _ = port_lanes[k]
+                                    lid, _ = candidates[k % len(candidates)]
+                                    _link(iid, lid)
             except Exception as exc:
                 print(f"  [Map] Intersection at node {n} failed: {exc}")
 
@@ -737,11 +1020,14 @@ def graph_to_map(
     # _respace_approach_lanes(all_lanes, geoms_road, ei, node_types, lanes_per_dir, node_in, node_out)
 
     # ---- Remove road lanes disconnected from the junction network ----
-    # A road lane is kept only if it is reachable (via successor links) from
-    # some intersection/roundabout connector.  Fully-isolated road segments
-    # (edges with no junction on either end, redundant roundabout ring edges)
-    # are dropped so the HD map has no floating roads.
-    conn_ids = {lid for lid in all_lanes if lid.startswith("int") or lid.startswith("ra")}
+    # A road lane is kept if it is reachable (via successor links) from some
+    # intersection/roundabout connector, OR if its compressed edge touches a
+    # junction node.  The graph-based keep matters: approach/connector lanes
+    # may have been dropped earlier by the hourglass/taper cleanup, which would
+    # otherwise orphan the whole road and leave a visible gap.  Only genuinely
+    # floating edges (no junction endpoint) and redundant roundabout ring edges
+    # (both endpoints roundabout) are dropped.
+    conn_ids = {lid for lid in all_lanes if lid.startswith(("int", "ra", "app"))}
     if conn_ids:
         _adj: dict[str, set[str]] = {}
         for _lid, _lane in all_lanes.items():
@@ -758,11 +1044,116 @@ def graph_to_map(
             for nb in _adj.get(cur, ()):
                 if nb not in reached:
                     stack.append(nb)
-        isolated = {lid for lid in all_lanes if lid.startswith("e") and lid not in reached}
+        junc_nodes = {n for n, t in enumerate(node_types) if int(t) in (1, 3)}
+        road_keep: set[str] = set()
+        for _e in range(len(ei)):
+            _u, _v = int(ei[_e, 0]), int(ei[_e, 1])
+            if _u in junc_nodes and _v in junc_nodes:
+                if int(node_types[_u]) == 3 and int(node_types[_v]) == 3:
+                    continue  # roundabout ring edge
+            if _u in junc_nodes or _v in junc_nodes:
+                for _i in range(2 * int(lanes_per_dir[_e])):
+                    road_keep.add(f"e{_e}_l{_i}")
+        isolated = {
+            lid
+            for lid in all_lanes
+            if lid.startswith("e") and lid not in reached and lid not in road_keep
+        }
         for lid in isolated:
             del all_lanes[lid]
         if isolated:
             print(f"  [Map] removed {len(isolated)} isolated road lanes")
+
+    # ---- Repair degenerate hourglass lanes (self-intersecting) ----------
+    # A lane whose left/right boundaries cross (or whose boundary self-
+    # intersects) forms a bowtie/hourglass polygon.  These come from sharp
+    # centreline kinks (road lanes), from tapering approach lanes whose lateral
+    # offset sweep crosses, and from sharp turn connectors inside junctions.
+    # Each crossing lane is truncated at its first crossing so it stays a valid
+    # lane (no road gaps); only truly degenerate lanes are dropped.
+    repaired_hg = 0
+    dropped_hg: dict[str, int] = {}
+    for _lid, _lane in list(all_lanes.items()):
+        _lt, _rt = _lane.left_side, _lane.right_side
+        if _lt is None or _rt is None or _lt.is_empty or _rt.is_empty:
+            continue
+        try:
+            _lta = np.array(list(_lt.coords))
+            _rta = np.array(list(_rt.coords))
+            if len(_lta) < 2 or len(_rta) < 2:
+                continue
+            # Only act on the visible hourglass: the two lane sides actually
+            # cross each other (or a single side folds back on itself).  Lanes
+            # that are merely "invalid" without crossing are kept — dropping
+            # them would clean up roads that render fine.
+            if not LineString(_lta).crosses(LineString(_rta)) and (
+                LineString(_lta).is_simple and LineString(_rta).is_simple
+            ):
+                continue
+            # A crossing lane that cannot be repaired is dropped only when it
+            # is visibly wide; thin/near-zero-width crossings are near-invisible
+            # and kept so the road network loses as few lanes as possible.
+            _max_width = float(np.linalg.norm(_lta[0] - _rta[0]))
+            for _k in range(1, min(len(_lta), len(_rta))):
+                _max_width = max(_max_width, float(np.linalg.norm(_lta[_k] - _rta[_k])))
+            if _repair_hourglass_lane(_lane):
+                repaired_hg += 1
+                continue
+            if _max_width < 1.5:
+                continue  # thin crossing — near-invisible, keep it
+            all_lanes.pop(_lid)
+            _t = _lid.split("_")[0]
+            dropped_hg[_t] = dropped_hg.get(_t, 0) + 1
+        except Exception:
+            continue
+    if repaired_hg or dropped_hg:
+        print(
+            f"  [Map] repaired {repaired_hg} hourglass lanes, "
+            f"dropped {sum(dropped_hg.values())} degenerate {dropped_hg}"
+        )
+
+    # ---- Trim taper lanes (converge-to-a-point tips) ------------------
+    # Junction-approach added/dropped lanes taper to zero width; their tips
+    # narrower than a lane's half-width are cut so no road visually pinches
+    # to a single point.  3+ point lanes are trimmed; degenerate 2-point
+    # lanes (a single segment from full width to a point) are dropped.
+    trimmed = 0
+    dropped_taper: dict[str, int] = {}
+    for _lid, _lane in list(all_lanes.items()):
+        _lt, _rt = _lane.left_side, _lane.right_side
+        if _lt is None or _rt is None or _lt.is_empty or _rt.is_empty:
+            continue
+        _lta = np.array(list(_lt.coords))
+        _rta = np.array(list(_rt.coords))
+        _n = min(len(_lta), len(_rta))
+        if _n < 2:
+            continue
+        _w0 = float(np.linalg.norm(_lta[0] - _rta[0]))
+        _w1 = float(np.linalg.norm(_lta[-1] - _rta[-1]))
+        if min(_w0, _w1) >= 1.5:
+            continue
+        # Sub-lane-width slivers that never reach a real lane width and end in
+        # a point are phantom — drop them outright.
+        _maxw = float(np.linalg.norm(_lta[: min(_n, 32)] - _rta[: min(_n, 32)], axis=1).max())
+        for _k in range(min(_n, 32), _n, max(1, _n // 32)):
+            _maxw = max(_maxw, float(np.linalg.norm(_lta[_k] - _rta[_k])))
+        if _maxw < 1.5:
+            all_lanes.pop(_lid)
+            _t = _lid.split("_")[0]
+            dropped_taper[_t] = dropped_taper.get(_t, 0) + 1
+            continue
+        if _n < 3:
+            all_lanes.pop(_lid)
+            _t = _lid.split("_")[0]
+            dropped_taper[_t] = dropped_taper.get(_t, 0) + 1
+            continue
+        _trim_taper_lane(_lane)
+        trimmed += 1
+    if trimmed or dropped_taper:
+        print(
+            f"  [Map] trimmed {trimmed} taper tips, "
+            f"dropped {sum(dropped_taper.values())} degenerate tapers {dropped_taper}"
+        )
 
     # ---- Assemble Map ------------------------------------------------
     hd_map = Map(name=name, scenario_type=scenario_type)
@@ -776,9 +1167,14 @@ def graph_to_map(
     hd_map.set_boundary((0.0, map_w, 0.0, map_h))
 
     total_succ = sum(len(l.successors) for l in hd_map.lanes.values())
-    dead = sum(1 for l in hd_map.lanes.values() if not l.successors)
+    dead = {
+        p: sum(1 for l in hd_map.lanes.values() if l.id_.startswith(p) and not l.successors)
+        for p in ("e", "app", "int", "ra_")
+    }
     print(
         f"[Map] {len(hd_map.lanes)} lanes  {len(all_junctions)} junc  "
-        f"{len(all_areas)} area  {total_succ} succ  {dead} dead"
+        f"{len(all_areas)} area  {total_succ} succ  "
+        f"{sum(dead.values())} dead "
+        f"(e:{dead['e']} app:{dead['app']} int:{dead['int']} ra:{dead['ra_']})"
     )
     return hd_map

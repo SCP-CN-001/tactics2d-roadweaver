@@ -38,7 +38,7 @@ def quick_vis(hd_map: Map, path: str, dpi: int = 300):
             for side in (lane.left_side, lane.right_side):
                 if side is not None and not is_empty(side):
                     x, y = side.xy
-                    ax.plot(x, y, color="#222", lw=0.6, alpha=0.9)
+                    ax.plot(x, y, color="#222", lw=1.5, alpha=0.9)
         except Exception:
             pass
 
@@ -49,7 +49,7 @@ def quick_vis(hd_map: Map, path: str, dpi: int = 300):
             if shape and len(shape) > 2:
                 xs, ys = zip(*shape)
                 ax.fill(xs, ys, alpha=0.25, color="#888")
-                ax.plot(xs + (xs[0],), ys + (ys[0],), color="#555", lw=1.5, alpha=0.7)
+                ax.plot(xs + (xs[0],), ys + (ys[0],), color="#555", lw=2.0, alpha=0.7)
         except Exception:
             pass
 
@@ -66,7 +66,7 @@ def quick_vis(hd_map: Map, path: str, dpi: int = 300):
             for side in (lane.left_side, lane.right_side):
                 if side is not None and not is_empty(side):
                     x, y = side.xy
-                    ax.plot(x, y, color="#555", lw=0.5, alpha=0.6)
+                    ax.plot(x, y, color="#555", lw=1.0, alpha=0.6)
         except Exception:
             pass
 
