@@ -14,14 +14,14 @@ from typing import Any
 
 import pandas as pd
 
-from .osm_graph import (
+from data_generator.osm_graph import (
     build_city_name_map,
     clip_gdf_to_bbox,
     compute_bbox_latlon,
     load_city_geojson,
     patch_id_to_city,
 )
-from .prior_extractor import extract_all_priors
+from data_generator.prior_extractor import extract_all_priors
 
 logging.basicConfig(
     level=logging.INFO,

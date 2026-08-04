@@ -18,7 +18,7 @@ import osmnx as ox
 from shapely.geometry import box
 from tqdm import tqdm
 
-from .osm_graph import sanitize_city_name
+from data_generator.osm_graph import sanitize_city_name
 
 logger = logging.getLogger(__name__)
 

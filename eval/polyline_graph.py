@@ -490,6 +490,15 @@ def save_clean_map(
     print(f"  [clean-map] Saved {filepath} ({dpi} dpi)")
 
 
+def aspect_ratio(polylines: list[np.ndarray]) -> float:
+    """Bounding-box width/height ratio (>= 1) of a road polyline set."""
+    a = np.vstack(polylines)
+    xmin, ymin = a.min(axis=0)
+    xmax, ymax = a.max(axis=0)
+    w, h = xmax - xmin, ymax - ymin
+    return max(w, h) / max(min(w, h), 1e-6)
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 #  Direct polyline → graph (no skeletonisation)
 # ═══════════════════════════════════════════════════════════════════════════════

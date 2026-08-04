@@ -1,5 +1,5 @@
 data_dir: "data/urban_prior/2km/splits_style"
-vq_checkpoint: "runtimes/vq_vae_2km/checkpoints/best.pth"
+vq_checkpoint: "runtimes/vq_vae_2km/best.pth"
 cache_dir: "cache/masked_code_maps_2km_style"
 num_codes: 512
 code_map_size: 32

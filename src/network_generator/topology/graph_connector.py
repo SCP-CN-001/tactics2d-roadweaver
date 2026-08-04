@@ -7,19 +7,19 @@ from typing import Dict, List, Set, Tuple
 import numpy as np
 
 from network_generator.topology.graph_merge import merge_close_nodes
-from network_generator.topology.graph_simplify import simplify_chains as _simplify_chains_impl
-from network_generator.topology.graph_utils import (
-    adjacency_from_edges,
-    endpoint_nodes,
-    find_components,
-)
-from network_generator.topology.pathfinding import (
+from network_generator.topology.graph_pathfinding import (
     astar_connect_path,
     astar_grid,
     cost_map_from_road,
     line_field_support,
     nearest_road_px,
     sample_path_at_step,
+)
+from network_generator.topology.graph_simplify import simplify_chains as _simplify_chains_impl
+from network_generator.topology.graph_utils import (
+    adjacency_from_edges,
+    endpoint_nodes,
+    find_components,
 )
 
 

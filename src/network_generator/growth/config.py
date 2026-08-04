@@ -86,12 +86,16 @@ class GrowthConfig:
         # Dense cities (→ 50 km/km²): more seeds, shorter steps, longer reach
         # Sparse cities (→ 5 km/km²): fewer seeds, longer steps, shorter reach
         df = density / 20.0  # 1.0 at 20 km/km²
-        df = max(0.3, min(df, 3.0))  # clamp
+        df = max(0.3, min(df, 4.0))  # clamp (3.0→4.0: density scales to ~80)
 
-        seed_sp = map_size_m * max(0.04, 0.09 / df)
+        seed_sp = map_size_m * 0.09 / df  # no 0.04 floor: seeds keep scaling with density
         step = map_size_m * max(0.008, 0.02 / (df**0.5))
         max_len = map_size_m * min(0.6, 0.4 * (df**0.5))
         max_steps = max(8, min(30, int(18 * df**0.3)))
+        # Budget guard: without it, step shrinks faster than max_steps grows at
+        # high density, so per-front reachable length falls with density instead
+        # of rising.  Let fronts actually reach max_len.
+        max_steps = max(max_steps, int(np.ceil(max_len / step)))
         # G2: dense → more cuts
         g2_cuts = max(1, int(4 * df))
 
@@ -159,7 +163,13 @@ class GrowthConfig:
         jitter *= be_factor
         step_jitter *= 0.5 + bearing_entropy * 0.5
 
-        base_snap = map_size_m * 0.04 * (0.5 + df * 0.25)
+        # Snap radius decoupled from density: a linear-in-df snap_r grows
+        # past the (shrinking) seed spacing, so dense cities' fronts snap to a
+        # neighbour after ~1 step and G1 growth collapses.  Tight baseline
+        # (0.02 * map_size) lets fronts weave past each other before snapping,
+        # lifting end-to-end road density; style scale still differentiates
+        # grid/organic/radial.
+        base_snap = map_size_m * 0.02
         snap_r = max(map_size_m * 0.012, base_snap * snap_scale)
 
         # ── Tensor field params: style-aware ───────────────────────────

@@ -365,3 +365,239 @@ def plot_refine_comparison_grid(
     fig.tight_layout()
     fig.savefig(save_path, dpi=dpi, bbox_inches="tight")
     plt.close(fig)
+
+
+# ---------------------------------------------------------------------------
+# Compressed intersection graph panel (graph_utils node types: 1=junction,
+# 3=roundabout, 4=endpoint) — used by the per-map pipeline visualisation.
+# ---------------------------------------------------------------------------
+
+
+def draw_intersection_graph(
+    ax: plt.Axes,
+    coords: np.ndarray,
+    edge_index: np.ndarray,
+    node_types: np.ndarray,
+    lanes_per_dir: np.ndarray | None = None,
+    road_class: np.ndarray | None = None,
+    geoms: Sequence[np.ndarray] | None = None,
+    legend: bool = True,
+) -> list:
+    """Draw a compressed intersection graph onto *ax*.
+
+    Edges are coloured by road class (HUSL: primary green / secondary purple /
+    local orange) with line width proportional to lane count; nodes are drawn
+    by type (junction blue / roundabout red / endpoint yellow).  Returns the
+    legend handles so the caller can re-use them on a combined figure.
+    """
+    import husl
+    from matplotlib.lines import Line2D
+
+    rc_colors = {
+        1: husl.husl_to_hex(150, 65, 55),  # green
+        2: husl.husl_to_hex(280, 65, 55),  # purple
+        3: husl.husl_to_hex(40, 65, 55),  # orange
+    }
+    ax.set_facecolor("#f5f5f5")
+    n_j = int((node_types == 1).sum())
+    n_r = int((node_types == 3).sum())
+    n_e = int((node_types == 4).sum())
+
+    if len(coords):
+        for j, (u, v) in enumerate(edge_index):
+            lw = min(3.0, 0.3 + 0.35 * int(lanes_per_dir[j])) if j < len(lanes_per_dir) else 0.5
+            rc = int(road_class[j]) if road_class is not None and j < len(road_class) else 2
+            color = rc_colors.get(rc, "#888")
+            geom = geoms[j] if geoms is not None and j < len(geoms) else None
+            if geom is not None and len(geom) > 2:
+                ax.plot(geom[:, 0], geom[:, 1], color=color, lw=lw, alpha=0.7)
+            else:
+                ax.plot(
+                    [coords[u, 0], coords[v, 0]],
+                    [coords[u, 1], coords[v, 1]],
+                    color=color,
+                    lw=lw,
+                    alpha=0.7,
+                )
+
+        if n_j:
+            ax.scatter(
+                coords[node_types == 1, 0],
+                coords[node_types == 1, 1],
+                c="#1565C0",
+                s=40,
+                edgecolors="black",
+                lw=0.5,
+                zorder=3,
+            )
+        if n_r:
+            ax.scatter(
+                coords[node_types == 3, 0],
+                coords[node_types == 3, 1],
+                c="#E53935",
+                s=40,
+                edgecolors="black",
+                lw=0.5,
+                zorder=3,
+            )
+        if n_e:
+            ax.scatter(
+                coords[node_types == 4, 0],
+                coords[node_types == 4, 1],
+                c="#FDD835",
+                s=16,
+                edgecolors="black",
+                lw=0.3,
+                zorder=3,
+            )
+
+        xs, ys = coords[:, 0], coords[:, 1]
+        mx = max(0.02, (xs.max() - xs.min()) * 0.05)
+        my = max(0.02, (ys.max() - ys.min()) * 0.05)
+        ax.set_xlim(xs.min() - mx, xs.max() + mx)
+        ax.set_ylim(ys.min() - my, ys.max() + my)
+
+    items = []
+    if n_j:
+        items.append(
+            Line2D(
+                [0],
+                [0],
+                marker="o",
+                color="w",
+                markerfacecolor="#1565C0",
+                markeredgecolor="black",
+                markersize=8,
+                label=f"Junction ({n_j})",
+            )
+        )
+    if n_r:
+        items.append(
+            Line2D(
+                [0],
+                [0],
+                marker="o",
+                color="w",
+                markerfacecolor="#E53935",
+                markeredgecolor="black",
+                markersize=8,
+                label=f"Roundabout ({n_r})",
+            )
+        )
+    if n_e:
+        items.append(
+            Line2D(
+                [0],
+                [0],
+                marker="o",
+                color="w",
+                markerfacecolor="#FDD835",
+                markeredgecolor="black",
+                markersize=6,
+                label=f"Endpoint ({n_e})",
+            )
+        )
+    for rc_label, rc_val, hue in [
+        ("Primary (1)", 1, 150),
+        ("Secondary (2)", 2, 280),
+        ("Local (3)", 3, 40),
+    ]:
+        items.append(Line2D([0], [0], color=husl.husl_to_hex(hue, 65, 55), lw=2, label=rc_label))
+    for lw_val, label in [(0.65, "1 lane"), (1.0, "2 lanes"), (1.35, "3+ lanes")]:
+        items.append(Line2D([0], [0], color="#555", lw=lw_val, label=label))
+    if legend:
+        ax.legend(
+            handles=items,
+            fontsize=8,
+            loc="upper left",
+            bbox_to_anchor=(1.02, 1),
+            borderaxespad=0,
+            framealpha=0.9,
+        )
+    return items
+
+
+# ---------------------------------------------------------------------------
+# VQ-VAE reconstruction panels: per-sample folder (0_orig / 1_recon / 2_error
+# + combined) plus a full-sample grid.
+# ---------------------------------------------------------------------------
+
+
+def _to_np(x):
+    """Convert a torch tensor or numpy array to float ndarray."""
+    return x.cpu().numpy() if hasattr(x, "cpu") else np.asarray(x)
+
+
+def plot_recon_grid(
+    orig_fields, recon_fields, ious: Sequence[float], out_dir: str, n_samples: int | None = None
+) -> list:
+    """Save VQ-VAE reconstruction panels following the per-sample output rule.
+
+    For each sample writes ``recon_{i}/`` with ``0_orig.png``, ``1_recon.png``,
+    ``2_error.png`` and a ``combined.png`` (1×3); also writes a full-sample
+    ``grid.png`` (N×2, orig | recon).  Returns the list of per-sample dirs.
+    """
+    from pathlib import Path
+
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    n = min(n_samples or len(orig_fields), len(orig_fields))
+    dirs = []
+
+    for i in range(n):
+        folder = out / f"recon_{i}"
+        folder.mkdir(parents=True, exist_ok=True)
+        orig = _to_np(orig_fields[i, 0])
+        rec = _to_np(recon_fields[i, 0])
+        diff = np.abs(orig - rec)
+        iou = float(ious[i]) if i < len(ious) else float("nan")
+
+        # Individual panels
+        panels = [
+            ("0_orig.png", orig, "Original", "gray_r", (0, 1)),
+            ("1_recon.png", rec, "Reconstructed", "gray_r", (0, 1)),
+            ("2_error.png", diff, f"Error (IoU={iou:.3f})", "hot", (0, 0.5)),
+        ]
+        for fname, arr, title, cmap, vrange in panels:
+            fig, ax = plt.subplots(figsize=(4, 4))
+            ax.imshow(arr, cmap=cmap, vmin=vrange[0], vmax=vrange[1])
+            ax.set_title(title, fontsize=10)
+            ax.axis("off")
+            fig.tight_layout()
+            fig.savefig(folder / fname, dpi=150, bbox_inches="tight")
+            plt.close(fig)
+
+        # Combined (1×3)
+        fig, axes = plt.subplots(1, 3, figsize=(12, 4))
+        for ax, (arr, title, cmap, vrange) in zip(
+            axes,
+            [
+                (orig, "Original", "gray_r", (0, 1)),
+                (rec, "Reconstructed", "gray_r", (0, 1)),
+                (diff, f"Error (IoU={iou:.3f})", "hot", (0, 0.5)),
+            ],
+        ):
+            ax.imshow(arr, cmap=cmap, vmin=vrange[0], vmax=vrange[1])
+            ax.set_title(title, fontsize=10)
+            ax.axis("off")
+        fig.tight_layout()
+        fig.savefig(folder / "combined.png", dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        dirs.append(folder)
+
+    # Full-sample grid (N×2)
+    fig, axes = plt.subplots(n, 2, figsize=(8, 4 * n))
+    axes = np.atleast_2d(axes)
+    for i in range(n):
+        orig = _to_np(orig_fields[i, 0])
+        rec = _to_np(recon_fields[i, 0])
+        axes[i, 0].imshow(orig, cmap="gray_r", vmin=0, vmax=1)
+        axes[i, 0].set_title(f"Original {i}", fontsize=9)
+        axes[i, 0].axis("off")
+        axes[i, 1].imshow(rec, cmap="gray_r", vmin=0, vmax=1)
+        axes[i, 1].set_title(f"Recon {i}", fontsize=9)
+        axes[i, 1].axis("off")
+    fig.tight_layout()
+    fig.savefig(out / "grid.png", dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    return dirs

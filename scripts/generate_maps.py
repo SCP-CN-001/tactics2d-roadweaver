@@ -4,9 +4,9 @@ CLI entry point for RoadWeaver graph generation.
 
 Usage::
     conda activate road-weaver
-    python scripts/generate.py                          # 6 samples
-    python scripts/generate.py --n-samples 24           # more samples
-    python scripts/generate.py --map-w 3000 --map-h 2000  # non-square
+    python scripts/generate_maps.py                          # 6 samples
+    python scripts/generate_maps.py --n-samples 24           # more samples
+    python scripts/generate_maps.py --map-w 3000 --map-h 2000  # non-square
 """
 
 from __future__ import annotations
@@ -27,21 +27,21 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 # ── Args ──
 import argparse
 
-from assemble_hdmap import graph_to_map, quick_vis
-from generate_graph import generate_branch, generate_skeleton
+from network_generator import run_pipeline
 from network_generator.backbone.config import CONFIG
 from network_generator.backbone.dataset import make_field_dataloader
-from network_generator.backbone.generator import Generator
-from network_generator.topology.graph_ops import NT_ENDPOINT, NT_JUNCTION, NT_ROUNDABOUT
+from network_generator.backbone.generator import Generator, make_generator
+from network_generator.topology.graph_utils import NT_ENDPOINT, NT_JUNCTION, NT_ROUNDABOUT
+from utils.render import render_map
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--n-samples", type=int, default=6)
 parser.add_argument("--map-w", type=float, default=2000.0)
 parser.add_argument("--map-h", type=float, default=2000.0)
-parser.add_argument("--vq-ckpt", default="runtimes/vq_vae_2km_phase_a/checkpoints/best.pth")
-parser.add_argument("--model-ckpt", default="runtimes/transformer_2km_phase_a/checkpoints/best.pth")
-parser.add_argument("--cache", default="cache/masked_code_maps_2km_phase_a/train.npz")
-parser.add_argument("--output", default="analysis/e2e_phase_a")
+parser.add_argument("--vq-ckpt", default="runtimes/vq_vae_2km/best.pth")
+parser.add_argument("--model-ckpt", default="runtimes/transformer_2km/best.pth")
+parser.add_argument("--cache", default="cache/masked_code_maps_2km/train.npz")
+parser.add_argument("--output", default="analysis/e2e")
 parser.add_argument("--seed", type=int, default=0)
 args = parser.parse_args()
 
@@ -58,20 +58,7 @@ CONFIG.resolution = 128
 CONFIG.code_map_size = 32
 CONFIG.val_split_path = "data/urban_prior/2km/splits_style/val.parquet"
 
-gen = Generator(
-    vq_checkpoint=args.vq_ckpt,
-    model_checkpoint=args.model_ckpt,
-    cache_path=args.cache,
-    device=DEVICE,
-    num_codes=512,
-    resolution=128,
-    code_map_size=32,
-    d_model=256,
-    num_layers=6,
-    nhead=4,
-    use_adaln=True,
-    cond_dim=11,
-)
+gen = make_generator(args.vq_ckpt, args.model_ckpt, cache_path=args.cache, device=DEVICE)
 
 dl = make_field_dataloader("val", batch_size=N, num_workers=0, limit_samples=N, cache_fields=False)
 batch = next(iter(dl))
@@ -87,7 +74,7 @@ for i in range(N):
     print(f"\n[{i}] {pnames[pid]} density={d_val:.1f} {MAP_W:.0f}x{MAP_H:.0f}m")
 
     try:
-        skel = generate_skeleton(
+        result = run_pipeline(
             gen,
             cond[i],
             struct[i],
@@ -95,18 +82,10 @@ for i in range(N):
             map_h=MAP_H,
             vq_map_size_m=VQ_MAP,
             seed=args.seed + i,
+            name=f"rw_{i}",
+            scenario_type="urban",
         )
-        branch = generate_branch(
-            skel["coords"],
-            skel["edge_index"],
-            skel["road_field"],
-            skel["condition"],
-            map_w=MAP_W,
-            map_h=MAP_H,
-            density=skel["density"],
-            gridness=skel["gridness"],
-            organic=skel["organic"],
-        )
+        skel, branch, hd_map = result["skeleton"], result["branch"], result["hdmap"]
     except Exception as e:
         print(f"  FAILED: {e}")
         all_results.append(None)
@@ -119,22 +98,10 @@ for i in range(N):
     ne = int((nt == 4).sum())
     print(f"  {len(c_int)}n {len(ei_int)}e J={nj} R={nr} E={ne}")
 
-    # ── Assemble HD Map ──
+    # ── Render HD Map ──
     try:
-        hd_map = graph_to_map(
-            branch["coords_int"],
-            branch["edge_index_int"],
-            branch["geometries"],
-            node_types=branch["node_types"],
-            lanes_per_dir=branch["lanes_per_dir"],
-            road_class=branch["road_class"],
-            map_w=MAP_W,
-            map_h=MAP_H,
-            name=f"rw_{i}",
-            scenario_type="urban",
-        )
         vis_path = OUT / f"hdmap_{i}.png"
-        quick_vis(hd_map, str(vis_path), dpi=300)
+        render_map(hd_map, str(vis_path), dpi=300)
     except Exception as e:
         print(f"  HDMap FAILED: {e}")
         hd_map = None
@@ -147,13 +114,13 @@ if not valid:
     print("No valid results")
     sys.exit(0)
 
-fig, axes = plt.subplots(2, N, figsize=(4 * N, 7))
+fig, axes = plt.subplots(2, N, figsize=(4 * N, 7), squeeze=False)
 scaled = abs(MAP_W / VQ_MAP - 1) > 0.01 or abs(MAP_H / VQ_MAP - 1) > 0.01
 
 for i in range(N):
     r = all_results[i]
     for row in (0, 1):
-        ax = axes[row, i] if N > 1 else axes[row]
+        ax = axes[row, i]
         if r is None:
             ax.text(
                 0.5, 0.5, "FAILED", ha="center", va="center", transform=ax.transAxes, fontsize=10
@@ -256,7 +223,7 @@ if len(hd_valid) > 0:
     n_hd = len(hd_valid)
     rows = (n_hd + 2) // 3
     fig, axes = plt.subplots(rows, 3, figsize=(15, 5 * rows))
-    axes = axes.flatten() if rows > 1 else [axes]
+    axes = np.atleast_1d(axes).flatten()
     for idx, (i, r) in enumerate(hd_valid):
         ax = axes[idx]
         hd = r["hdmap"]

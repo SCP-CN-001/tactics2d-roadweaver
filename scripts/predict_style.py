@@ -10,10 +10,9 @@ import os
 import numpy as np
 import torch
 
+from style_predictor.dataset import load_image, to_tensor
+from style_predictor.encoder import build_encoder
 from utils.patterns import PATTERN_NAMES, STYLE_DIM
-
-from .dataset import load_image, to_tensor
-from .encoder import build_encoder
 
 IMAGE_SIZE = 224
 

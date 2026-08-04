@@ -1,6 +1,6 @@
 """Topology module."""
 
-from .connector import EndpointConnector
+from .graph_connector import EndpointConnector
 from .graph_intersection import detect_roundabouts
 from .graph_merge import merge_close_nodes
 from .graph_simplify import simplify_chains

@@ -45,9 +45,9 @@ from network_generator.backbone.generator import make_generator  # noqa: E402
 REPO = Path(__file__).resolve().parent.parent
 OUTPUT_DIR = REPO / "runtimes" / "roadweaver_eval"
 
-VQ_CKPT = "runtimes/vq_vae_2km_phase_a/checkpoints/best.pth"
-TFM_CKPT = "runtimes/transformer_2km_phase_a/checkpoints/best.pth"
-CACHE = "cache/masked_code_maps_2km_phase_a/train.npz"
+VQ_CKPT = "runtimes/vq_vae_2km/best.pth"
+TFM_CKPT = "runtimes/transformer_2km/best.pth"
+CACHE = "cache/masked_code_maps_2km/train.npz"
 VQ_MAP_M = 2000.0  # VQ native map size (m)
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -107,6 +107,11 @@ def generate_one_map(
 ) -> dict:
     """Run the full pipeline once, return the branch dict + timing.
 
+    ``gen_time`` is defined as the full **HD-map-level** generation cost: the
+    skeleton/branch graph pipeline plus the ``graph_to_map`` HD-map assembly
+    (lane/junction geometry + topology repair).  ``assemble_hdmap=True`` so the
+    timed work matches what ``build_map`` produces (a deployable tactics2d Map).
+
     The generator's ``torch.multinomial`` sampling uses the *global* torch RNG,
     so ``torch.manual_seed`` must be called before the pipeline call.
     """
@@ -123,7 +128,7 @@ def generate_one_map(
         seed=seed,
         name=name,
         scenario_type="urban",
-        assemble_hdmap=False,
+        assemble_hdmap=True,
     )
     gen_time = time.time() - t0
     return {"branch": result["branch"], "gen_time": gen_time}
@@ -228,7 +233,9 @@ def run_bins(
     ref_deg = load_osm_reference_degree()
     target_bins = list(range(10, 81, 5))  # [10,15,...,80]
     bin_counts = {b: 0 for b in target_bins}
-    densities = list(range(2, 23))  # density 2..22 → roughly 10..150 nodes
+    # density 1.0 yields ~10-20-node maps (fills the small bins 10/15); 2..22
+    # cover the rest.  The sweep runs low→high so small bins fill first.
+    densities = [1.0] + list(range(2, 23))  # density 1..22 → roughly 10..150 nodes
 
     def _bin(n):
         return (n // 5) * 5
@@ -253,6 +260,127 @@ def run_bins(
     t0 = time.time()
     init_stats = get_resource_stats()
     peak_stats = {"cpu_percent": 0.0, "mem_mb": 0.0, "gpu_mem_mb": 0.0}
+
+    # ---- fill the rare small bins (10/15/20) first --------------------
+    # The generator rarely yields 10-19-node maps (density 1-2 draws mostly
+    # land in 25+ node bins), so a one-pass density sweep stalls before those
+    # bins fill.  Pre-draw low-density maps and keep only the ones that land in
+    # an unfilled small bin; the rest are discarded (cheap: small maps build
+    # fast).
+    small_bins = [b for b in target_bins if b <= 20]
+    small_densities = (1.0, 1.5, 2.0, 3.0)
+    n_small = 0
+    while (
+        n_new < 240
+        and n_small < 500
+        and any(bin_counts.get(b, 0) < target_per_bin for b in small_bins)
+    ):
+        n_small += 1
+        d = small_densities[n_small % len(small_densities)]
+        seed = base_seed + n_small
+        key = f"{d}|{seed}"
+        if key in seen_keys:
+            continue
+        try:
+            _cond = build_condition(d).to(DEVICE)
+            with monitor_resources(interval=0.3) as peaks:
+                r = generate_one_map(gen, _cond, _cond[6:11], seed, map_w, map_h)
+                branch = r["branch"]
+            n = len(branch["coords_int"])
+            if n < 2:
+                continue
+        except Exception as e:
+            print(f"    small-fill density={d} seed={seed} FAILED: {e}")
+            continue
+        nb = _bin(n)
+        if nb not in small_bins or bin_counts.get(nb, 0) >= target_per_bin:
+            continue  # discard: not a missing small bin
+        row = compute_row(
+            branch,
+            r["gen_time"],
+            peaks,
+            ref_deg,
+            mode="bins",
+            seed=seed,
+            density=d,
+            map_w=map_w,
+            map_h=map_h,
+            map_id=existing_count + n_new,
+        )
+        n_new += 1
+        peak_stats["cpu_percent"] = max(peak_stats["cpu_percent"], peaks["cpu_peak"])
+        peak_stats["mem_mb"] = max(peak_stats["mem_mb"], peaks["mem_peak_mb"])
+        peak_stats["gpu_mem_mb"] = max(peak_stats["gpu_mem_mb"], peaks["gpu_peak_mb"])
+        append_csv_row(csv_path, list(row.keys()), row)
+        seen_keys.add(key)
+        bin_counts[nb] = bin_counts.get(nb, 0) + 1
+        if n_new % 10 == 0:
+            filled = sum(1 for c in bin_counts.values() if c >= target_per_bin)
+            print(f"  [small-fill {n_small}] bins filled: {filled}/{len(target_bins)}")
+    if n_small:
+        print(f"  small-bin prefill: {n_small} draws, kept {n_new} maps in bins {small_bins}")
+
+    # ---- fill the high bins (55-80) with a larger map area -------------
+    # The bins are node-count buckets.  Node count in this pipeline is mostly
+    # density-driven but noisy and saturates for density > ~40, so cranking the
+    # density is a slow way to reach 55-80-node maps.  A larger map area at
+    # moderate density reliably yields 55-90-node maps (tested: 3000×3000 m at
+    # density 12 → 61-78 nodes), so pre-fill the high bins with big-area draws
+    # and keep only those that land in an unfilled high bin.
+    high_bins = [b for b in target_bins if b > 50]
+    high_area = 3000.0
+    n_high = 0
+    while (
+        n_new < 280
+        and n_high < 400
+        and any(bin_counts.get(b, 0) < target_per_bin for b in high_bins)
+    ):
+        n_high += 1
+        d = 12.0
+        seed = base_seed + n_high
+        key = f"{high_area}|{d}|{seed}"
+        if key in seen_keys:
+            continue
+        try:
+            _cond = build_condition(d).to(DEVICE)
+            with monitor_resources(interval=0.3) as peaks:
+                r = generate_one_map(
+                    gen, _cond, _cond[6:11], seed, high_area, high_area, name=f"rw_hi{n_high}"
+                )
+                branch = r["branch"]
+            n = len(branch["coords_int"])
+            if n < 2:
+                continue
+        except Exception as e:
+            print(f"    high-fill density={d} seed={seed} FAILED: {e}")
+            continue
+        nb = _bin(n)
+        if nb not in high_bins or bin_counts.get(nb, 0) >= target_per_bin:
+            continue  # discard: not a missing high bin
+        row = compute_row(
+            branch,
+            r["gen_time"],
+            peaks,
+            ref_deg,
+            mode="bins",
+            seed=seed,
+            density=d,
+            map_w=high_area,
+            map_h=high_area,
+            map_id=existing_count + n_new,
+        )
+        n_new += 1
+        peak_stats["cpu_percent"] = max(peak_stats["cpu_percent"], peaks["cpu_peak"])
+        peak_stats["mem_mb"] = max(peak_stats["mem_mb"], peaks["mem_peak_mb"])
+        peak_stats["gpu_mem_mb"] = max(peak_stats["gpu_mem_mb"], peaks["gpu_peak_mb"])
+        append_csv_row(csv_path, list(row.keys()), row)
+        seen_keys.add(key)
+        bin_counts[nb] = bin_counts.get(nb, 0) + 1
+        if n_new % 10 == 0:
+            filled = sum(1 for c in bin_counts.values() if c >= target_per_bin)
+            print(f"  [high-fill {n_high}] bins filled: {filled}/{len(target_bins)}")
+    if n_high:
+        print(f"  high-bin prefill: {n_high} draws, kept {n_new} maps in bins {high_bins}")
 
     for density in densities:
         condition = build_condition(float(density)).to(DEVICE)
@@ -327,7 +455,7 @@ def run_bins(
                         f"  [{existing_count + n_new} maps] bins filled: {filled}/{len(target_bins)}"
                     )
 
-            if consecutive_stall >= 30:
+            if consecutive_stall >= 8:
                 print(
                     f"    density={density}: stall ({consecutive_stall} seeds no progress), skipping"
                 )

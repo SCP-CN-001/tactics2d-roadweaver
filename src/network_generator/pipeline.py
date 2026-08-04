@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 from typing import Any
 
 import networkx as nx
@@ -13,7 +14,6 @@ import yaml
 from hdmap_generator import assign_lanes, graph_to_map
 from network_generator.growth.config import GrowthConfig
 from network_generator.growth.growth import grow
-from network_generator.topology.connector import EndpointConnector
 from network_generator.topology.graph_cleanup import (
     clean_parallel_roads,
     clean_sharp_angles,
@@ -22,6 +22,7 @@ from network_generator.topology.graph_cleanup import (
     prune_dead_ends,
     snap_endpoints,
 )
+from network_generator.topology.graph_connector import EndpointConnector
 from network_generator.topology.graph_intersection import (
     classify_nodes,
     compress_to_intersection_graph,
@@ -58,6 +59,7 @@ def generate_skeleton(
     temperature: float = 0.75,
     top_p: float = 0.65,
     seed: int | None = None,
+    return_intermediates: bool = False,
 ) -> dict:
     """Generate and clean a skeleton graph from VQ + Transformer.
 
@@ -82,6 +84,7 @@ def generate_skeleton(
     field = raw["road_field"]
     coords_n = raw["coords"].copy()  # normalized [0, 1] in VQ space
     ei = raw["edge_index"].copy()
+    intermediates = {"raw": (coords_n.copy(), ei.copy())}  # c1: post-VQ skeleton
 
     if len(coords_n) < 5:
         raise ValueError(f"Skeleton too small ({len(coords_n)} nodes)")
@@ -107,6 +110,7 @@ def generate_skeleton(
         coords_n, ei = simp[0], simp[1]
     except Exception:
         pass
+    intermediates["simplified"] = (coords_n.copy(), ei.copy())  # c2: after chain simplify
 
     # Scale to target map size
     sx, sy = map_w / vq_map_size_m, map_h / vq_map_size_m
@@ -132,6 +136,7 @@ def generate_skeleton(
         "gridness": gridness,
         "organic": organic,
         "condition": condition,
+        **({"intermediates": intermediates} if return_intermediates else {}),
     }
 
 
@@ -163,6 +168,7 @@ def generate_branch(
     chord_dup_dist_m: float = 40.0,
     chord_detour_ratio: float = 0.10,
     chord_angle_deg: float = 20.0,
+    return_intermediates: bool = False,
 ) -> dict:
     """Grow collector roads (G1) and local roads (G2), then clean up.
 
@@ -212,6 +218,7 @@ def generate_branch(
     coords_norm = grown["coords"] / np.array([map_w, map_h])
     ei = grown["edge_index"].copy()
     road_class = grown.get("road_class", np.ones(len(ei), dtype=np.int64))
+    intermediates = {"growth": (coords_norm.copy(), ei.copy())}  # c5: growth output
 
     # ── Merge close nodes in growth graph ─────────────────────────
     merge_dist_norm = max(0.003, 30.0 / map_max)
@@ -237,6 +244,7 @@ def generate_branch(
         coords_norm, ei, map_max, angle_deg=20.0, max_dist_m=25.0
     )
     coords_norm, ei = keep_lcc(coords_norm, ei)
+    intermediates["cleanup"] = (coords_norm.copy(), ei.copy())  # c6: raw cleaned
 
     # ── Compress to intersection graph ─────────────────────────────
     # 1. Compress + initial merge
@@ -306,6 +314,7 @@ def generate_branch(
         "lanes_per_dir": lanes,
         "geometries": geoms,
         "road_class": road_class,
+        **({"intermediates": intermediates} if return_intermediates else {}),
     }
 
 
@@ -434,3 +443,46 @@ def run_pipeline(
             scenario_type=scenario_type,
         )
     return result
+
+
+def build_map(
+    seed: int = 0,
+    *,
+    map_size_m: float = 2000.0,
+    device: str | None = None,
+    vq_ckpt: str | None = None,
+    tfm_ckpt: str | None = None,
+    cache_path: str | None = None,
+):
+    """Generate one RoadWeaver HD map from *seed* (thin wrapper over run_pipeline).
+
+    Builds an 11-dim condition (style = one-hot over ``seed % 6`` patterns,
+    structural priors at the 2km defaults), runs the full pipeline and returns
+    the assembled tactics2d Map.  Mirrors the former ``render_tactics2d.build_map``
+    (now removed) so demos can swap it in directly.
+    """
+    from network_generator.backbone.generator import make_generator
+
+    repo = Path(__file__).resolve().parent.parent.parent
+    vq_ckpt = vq_ckpt or str(repo / "runtimes/vq_vae_2km/best.pth")
+    tfm_ckpt = tfm_ckpt or str(repo / "runtimes/transformer_2km/best.pth")
+    cache_path = cache_path or str(repo / "cache/masked_code_maps_2km/train.npz")
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    gen = make_generator(vq_ckpt, tfm_ckpt, cache_path=cache_path, device=device)
+    sv = torch.zeros(1, 6, device=device)
+    sv[0, seed % 6] = 1.0
+    sp = torch.tensor([[15.0, 0.5, 0.5, 0.5, 0.5]], dtype=torch.float, device=device)
+    cond = torch.cat([sv, sp], dim=1)
+    result = run_pipeline(
+        gen,
+        cond,
+        cond[0, 6:],
+        map_w=map_size_m,
+        map_h=map_size_m,
+        name=f"rw_{seed}",
+        scenario_type="urban",
+        seed=seed,
+    )
+    return result["hdmap"]

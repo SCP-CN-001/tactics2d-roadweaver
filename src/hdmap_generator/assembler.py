@@ -572,6 +572,22 @@ def graph_to_map(
             all_lanes[a].add_related_lane(b, LaneRelationship.SUCCESSOR)
             pairs.add((a, b))
 
+    def _stitch(lid):
+        # Remove lane *lid* while keeping the successor graph traversable:
+        # every lane that pointed to it is linked onward to the lanes it
+        # pointed to (P → X → S becomes P → S).  Without this, dropping the
+        # taper/hourglass victims below leaves dangling successors and the
+        # road lanes that fed them become dead ends.
+        preds = [p for p, pl in all_lanes.items() if lid in pl.successors]
+        succs = list(all_lanes[lid].successors) if lid in all_lanes else []
+        for p in preds:
+            pl = all_lanes[p]
+            pl.successors.discard(lid)  # clear the dangling reference
+            for s in succs:
+                if s in all_lanes and s != p:
+                    _link(p, s)
+        all_lanes.pop(lid, None)
+
     # ---- Roundabout grouping: adjacent RA nodes -> one roundabout ----
     ra_nodes = {n for n, t in enumerate(node_types) if int(t) == 3}
     ra_adj: dict[int, set[int]] = {n: set() for n in ra_nodes}
@@ -763,7 +779,16 @@ def graph_to_map(
                         centerline=cl,
                         start_lane_num=app_start_n,
                         end_lane_num=app_end_n,
-                        end_boundary_offsets=np.array(bdy_offsets),
+                        end_boundary_offsets=(
+                            np.array(bdy_offsets)
+                            if is_in
+                            else np.array(
+                                [
+                                    n_lanes * LANE_WIDTH_M / 2.0 - i * LANE_WIDTH_M
+                                    for i in range(n_lanes + 1)
+                                ]
+                            )
+                        ),
                         lane_width=LANE_WIDTH_M,
                         speed_limit=20.0,
                         id_offset=id_counter,
@@ -773,7 +798,19 @@ def graph_to_map(
                     for aln in app_res.lanes:
                         alid = f"app_{aln.id_}"
                         all_lanes[alid] = aln
+                        _old_id = aln.id_
                         aln.id_ = alid
+                        # JunctionApproach sets internal entry→exit
+                        # successor/predecessor links using pre-rename numeric
+                        # ids; remap them to the app_<n> names so they survive.
+                        aln.successors = {
+                            f"app_{s}" if s.isdigit() and s != _old_id else s
+                            for s in aln.successors
+                        }
+                        aln.predecessors = {
+                            f"app_{s}" if s.isdigit() and s != _old_id else s
+                            for s in aln.predecessors
+                        }
 
                     entry_ids = [f"app_{lid}" for lid in app_res.ports["entry"].lane_ids]
                     exit_ids = [f"app_{lid}" for lid in app_res.ports["exit"].lane_ids]
@@ -940,7 +977,16 @@ def graph_to_map(
                             centerline=cl,
                             start_lane_num=app_start_n,
                             end_lane_num=app_end_n,
-                            end_boundary_offsets=np.array(bdy_offsets),
+                            end_boundary_offsets=(
+                                np.array(bdy_offsets)
+                                if is_in
+                                else np.array(
+                                    [
+                                        n_lanes * LANE_WIDTH_M / 2.0 - i * LANE_WIDTH_M
+                                        for i in range(n_lanes + 1)
+                                    ]
+                                )
+                            ),
                             lane_width=LANE_WIDTH_M,
                             speed_limit=30.0,
                             id_offset=id_counter,
@@ -951,8 +997,20 @@ def graph_to_map(
                         for aln in app_res.lanes:
                             alid = f"app_{aln.id_}"
                             all_lanes[alid] = aln
+                            _old_id = aln.id_
                             aln.id_ = alid
                             app_lanes.append(alid)
+                            # JunctionApproach sets internal entry→exit
+                            # successor/predecessor links using pre-rename
+                            # numeric ids; remap them to app_<n> names.
+                            aln.successors = {
+                                f"app_{s}" if s.isdigit() and s != _old_id else s
+                                for s in aln.successors
+                            }
+                            aln.predecessors = {
+                                f"app_{s}" if s.isdigit() and s != _old_id else s
+                                for s in aln.predecessors
+                            }
 
                         entry_ids = [f"app_{lid}" for lid in app_res.ports["entry"].lane_ids]
                         exit_ids = [f"app_{lid}" for lid in app_res.ports["exit"].lane_ids]
@@ -1060,7 +1118,7 @@ def graph_to_map(
             if lid.startswith("e") and lid not in reached and lid not in road_keep
         }
         for lid in isolated:
-            del all_lanes[lid]
+            _stitch(lid)
         if isolated:
             print(f"  [Map] removed {len(isolated)} isolated road lanes")
 
@@ -1101,7 +1159,7 @@ def graph_to_map(
                 continue
             if _max_width < 1.5:
                 continue  # thin crossing — near-invisible, keep it
-            all_lanes.pop(_lid)
+            _stitch(_lid)
             _t = _lid.split("_")[0]
             dropped_hg[_t] = dropped_hg.get(_t, 0) + 1
         except Exception:
@@ -1138,12 +1196,12 @@ def graph_to_map(
         for _k in range(min(_n, 32), _n, max(1, _n // 32)):
             _maxw = max(_maxw, float(np.linalg.norm(_lta[_k] - _rta[_k])))
         if _maxw < 1.5:
-            all_lanes.pop(_lid)
+            _stitch(_lid)
             _t = _lid.split("_")[0]
             dropped_taper[_t] = dropped_taper.get(_t, 0) + 1
             continue
         if _n < 3:
-            all_lanes.pop(_lid)
+            _stitch(_lid)
             _t = _lid.split("_")[0]
             dropped_taper[_t] = dropped_taper.get(_t, 0) + 1
             continue
@@ -1177,4 +1235,22 @@ def graph_to_map(
         f"{sum(dead.values())} dead "
         f"(e:{dead['e']} app:{dead['app']} int:{dead['int']} ra:{dead['ra_']})"
     )
+
+    # ---- Geometry-based topology repair ----------------------------------
+    # The tactic-level fixes above (junction-approach successor chains, OUT-port
+    # boundary alignment, stitch-on-drop) restore correct lane linking, but the
+    # generated road structure still leaves the directed successor graph sparse
+    # (~25 % forward reach), which caps random-pair routing success.  A
+    # geometry-based pass re-links each lane to the continuations that carry on
+    # its travel direction, turning the network into a routable one (~90 %+).
+    # Set RW_TOPOLOGY_REPAIR=0 to disable.
+    import os as _os
+
+    if _os.environ.get("RW_TOPOLOGY_REPAIR", "1") != "0":
+        from .topology_repair import repair_lane_topology
+
+        added = repair_lane_topology(hd_map)
+        if added:
+            print(f"  [Map] repaired lane topology: +{added} successor/neighbour links")
+
     return hd_map

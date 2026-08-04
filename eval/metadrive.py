@@ -49,7 +49,7 @@ from eval.metrics import (
     monitor_resources,
     save_binned_summary,
 )
-from eval.polyline_graph import polylines_to_graph, save_vis
+from eval.polyline_graph import aspect_ratio, polylines_to_graph, save_vis
 
 # Ensure the metadrive submodule is importable (shadows pip package)
 _metadrive_path = Path(__file__).resolve().parent.parent / "baselines" / "MetaDrive"
@@ -139,6 +139,52 @@ def generate_metadrive_map(seed: int, map_config: int = 7, graph_method: str = "
 # ═══════════════════════════════════════════════════════════════════════════
 #  CLI
 # ═══════════════════════════════════════════════════════════════════════════
+
+
+def find_clean_map(
+    n_target: int = 40,
+    max_aspect: float | None = 2.0,
+    map_configs: list[int] | None = None,
+    max_attempts: int = 40,
+    graph_method: str = "skeleton",
+    **kw,
+) -> dict:
+    """Generate MetaDrive maps until one lands near ``n_target`` nodes.
+
+    Uses ``graph_method="skeleton"`` — the only method that produces well-spread
+    10-80 node graphs (the legacy spatial-cluster method collapses any config to
+    4-6 nodes, see the note in ``main``).  Returns
+    ``{"polylines", "graph", "n_nodes"}``; raises ``RuntimeError`` on failure.
+    """
+    if map_configs is None:
+        map_configs = (
+            [50, 45, 40, 35, 30, 25, 20, 15, 10, 7]  # largest first
+            if n_target <= 0
+            else [25, 20, 30, 15, 35, 40]
+        )
+    best = None
+    for mc in map_configs:
+        for seed in range(max_attempts):
+            try:
+                r = generate_metadrive_map(seed, map_config=mc, graph_method=graph_method)
+            except Exception:
+                break  # invalid map_config → next config
+            G, polylines = r["graph"], r["polylines"]
+            n = G.number_of_nodes()
+            if n < 2 or not polylines:
+                continue
+            a = aspect_ratio(polylines)
+            if max_aspect and a > max_aspect:
+                continue
+            if n_target > 0 and 0.5 * n_target <= n <= 2 * n_target:
+                return {"polylines": polylines, "graph": G, "n_nodes": n}
+            # Track closest for fallback (n_target<=0 → largest n wins).
+            score = -n if n_target <= 0 else abs(n - n_target)
+            if best is None or score < best["score"]:
+                best = dict(score=score, polylines=polylines, graph=G, n_nodes=n)
+    if best is None:
+        raise RuntimeError("metadrive: could not generate a map within constraints")
+    return {"polylines": best["polylines"], "graph": best["graph"], "n_nodes": best["n_nodes"]}
 
 
 def main():

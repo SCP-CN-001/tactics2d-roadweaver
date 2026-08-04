@@ -11,7 +11,7 @@ from scipy.ndimage import binary_dilation, label
 from shapely.geometry import LineString, Point
 from shapely.strtree import STRtree
 
-from network_generator.topology.pathfinding import astar_connect_path, cost_map_from_road
+from network_generator.topology.graph_pathfinding import astar_connect_path, cost_map_from_road
 
 from .tensor_field import GraphTensorField, normalize
 
@@ -130,17 +130,20 @@ def gen_seeds(G, config, rng=None):
         # Number of seeds along this edge
         n = max(1, int(length / spacing * 1.2))
         t_vals = np.linspace(0.15, 0.85, n)
+        cur_u, cur_v = u, v  # remaining H sub-edge to split at each seed
         for t in t_vals:
             pt = pu + t * ev
-            # Split H edge at seed point — node becomes part of H topology
-            nid = _split_edge_at_point(G, u, v, pt)
-            if nid is None:
+            # The first split removes edge (u, v); later t's lie on the
+            # remaining sub-edge (cur_u, v), so split that instead.
+            nid = _split_edge_at_point(G, cur_u, cur_v, pt)
+            if nid is None or nid == cur_u or nid == cur_v:
                 continue
             for sign in (-1.0, 1.0):
                 direction = normalize(
                     sign * normal + rng.uniform(-config.g1_seed_jitter, config.g1_seed_jitter) * ed
                 )
-                seeds.append({"nid": nid, "pos": pt.copy(), "dir": direction, "pe": (u, nid)})
+                seeds.append({"nid": nid, "pos": pt.copy(), "dir": direction, "pe": (cur_u, nid)})
+            cur_u = nid  # remaining edge is now (nid, v)
     return seeds
 
 

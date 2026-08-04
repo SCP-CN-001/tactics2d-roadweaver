@@ -65,7 +65,7 @@ from eval.metrics import (
     monitor_resources,
     save_binned_summary,
 )
-from eval.polyline_graph import save_vis
+from eval.polyline_graph import aspect_ratio, save_vis
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  Paths
@@ -492,6 +492,56 @@ _WIDGET_LABELS = {
     "tJunction": "T-Junction",
     "roundabout": "Roundabout",
 }
+
+
+def find_clean_map(
+    n_target: int = 40,
+    max_aspect: float | None = 2.0,
+    widget_numbers: list[int] | None = None,
+    max_attempts: int = 5,
+    **kw,
+) -> dict:
+    """Generate RoadGen maps until one lands near ``n_target`` nodes.
+
+    RoadGen is slow (real-time generation), so we walk ``widget_numbers`` and
+    take the first map whose node count lands in ``[0.5*n_target, 2*n_target]``
+    with aspect ratio ≤ *max_aspect* (matching the old export scripts); when no
+    candidate passes, the closest-scoring map is returned instead.
+
+    Returns ``{"polylines", "graph", "n_nodes"}``; raises ``RuntimeError`` if
+    generation keeps failing.
+    """
+    if widget_numbers is None:
+        widget_numbers = (
+            [40, 36, 32, 28, 24, 20]  # largest first
+            if n_target <= 0
+            else [20, 16, 24, 12, 28, 32, 36, 40]
+        )
+    lo = 0 if n_target <= 0 else max(1, n_target // 2)
+    hi = 2 * n_target if n_target > 0 else float("inf")
+
+    best = None
+    for wn in widget_numbers:
+        for attempt in range(max_attempts):
+            try:
+                G, _gt, polylines = generate_one_map(widget_number=wn)
+            except Exception:
+                continue
+            if G is None or len(polylines) < 5 or G.number_of_nodes() < 2:
+                continue
+            n = G.number_of_nodes()
+            a = aspect_ratio(polylines)
+            if max_aspect and a > max_aspect:
+                continue
+            if lo <= n <= hi:
+                return {"polylines": polylines, "graph": G, "n_nodes": n}
+            # Track closest for fallback (n_target<=0 → largest n wins).
+            score = -n if n_target <= 0 else abs(n - n_target)
+            if best is None or score < best["score"]:
+                best = dict(score=score, polylines=polylines, graph=G, n_nodes=n)
+    if best is None:
+        raise RuntimeError("roadgen: could not generate a map within constraints")
+    return {"polylines": best["polylines"], "graph": best["graph"], "n_nodes": best["n_nodes"]}
 
 
 def main():

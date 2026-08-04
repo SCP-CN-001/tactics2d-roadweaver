@@ -234,6 +234,10 @@ class Generator(nn.Module):
 
         Returns a dict with 'coords', 'edge_index', 'node_types', 'road_field'.
         """
+        if seed is not None:
+            torch.manual_seed(seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(seed)
         code_map = self.generate_code_map(
             condition,
             anchor_ratio=anchor_ratio,

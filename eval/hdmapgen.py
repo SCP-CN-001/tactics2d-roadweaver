@@ -51,7 +51,7 @@ from eval.metrics import (
     monitor_resources,
     save_binned_summary,
 )
-from eval.polyline_graph import polylines_to_graph, save_vis
+from eval.polyline_graph import aspect_ratio, polylines_to_graph, save_vis
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  Paths
@@ -270,6 +270,45 @@ def regenerate_graphs() -> list[dict]:
         pickle.dump(all_graphs, f)
     print(f"    Generated {len(all_graphs)} graphs, saved to {GRAPH_PKL}")
     return all_graphs
+
+
+def find_clean_map(n_target: int = 40, max_aspect: float | None = 2.0, **kw) -> dict:
+    """Pick the pre-generated entry closest to ``n_target`` post-contraction nodes.
+
+    Node count is measured on the *contracted* graph (``dict_to_nx`` with
+    ``graph_method="legacy"``), matching the ``node_bin`` used across the eval
+    (not the raw ``entry["num_nodes"]``).  ``n_target <= 0`` selects the largest
+    graph.  Returns ``{"polylines", "graph", "n_nodes"}``; raises
+    ``RuntimeError`` when no entry satisfies the constraints.
+    """
+    if not GRAPH_PKL.exists():
+        regenerate_graphs()
+    data = load_generated_graphs()
+
+    best = None
+    for entry in data:
+        try:
+            G = dict_to_nx(entry, graph_method="legacy", scale_to_meters=_HDMAPGEN_METER_SCALE)
+        except Exception:
+            continue
+        n = G.number_of_nodes()
+        if n < 2:
+            continue
+        polylines = extract_polylines_from_subnodes(entry, scale_to_meters=_HDMAPGEN_METER_SCALE)
+        if not polylines:
+            continue
+        a = aspect_ratio(polylines)
+        if max_aspect and a > max_aspect:
+            continue
+        # n_target <= 0 → largest; otherwise closest to target.
+        score = -n if n_target <= 0 else abs(n - n_target)
+        if best is None or score < best["score"]:
+            best = dict(score=score, n_nodes=n, polylines=polylines, graph=G)
+    if best is None:
+        raise RuntimeError(
+            f"hdmapgen: no entry within n≈{n_target} / aspect≤{max_aspect} constraints"
+        )
+    return {"polylines": best["polylines"], "graph": best["graph"], "n_nodes": best["n_nodes"]}
 
 
 # ═══════════════════════════════════════════════════════════════════════════
