@@ -43,6 +43,9 @@ BASELINES = {
 # ── Data loading ────────────────────────────────────────────────────────────
 
 
+MAX_BIN = 70  # fair-comparison range: data plotted only up to 70 nodes
+
+
 def load_bins(name: str) -> dict:
     """Load ``runtimes/{name}_eval/all_metrics_by_bin.csv`` as {metric: [(x, m, s, n)]}."""
     path = REPO / "runtimes" / f"{name}_eval" / "all_metrics_by_bin.csv"
@@ -65,6 +68,9 @@ def load_bins(name: str) -> dict:
             out.setdefault(base, []).append((b, m, s, n))
     for k in out:
         out[k].sort(key=lambda t: t[0])
+    # Fair-comparison range: plot data only up to 70 nodes (axis pads to 75).
+    for k in out:
+        out[k] = [t for t in out[k] if t[0] <= MAX_BIN]
     return out
 
 
@@ -200,6 +206,7 @@ def save_single(
     *,
     log: bool = False,
     ylim=None,
+    xlim=None,
     cap: bool = False,
     special=None,
     xticks=None,
@@ -222,6 +229,8 @@ def save_single(
     if ylim is None and not log:
         ylim = compute_ylim(metric)
     style_ax(ax, log=log, ylim=ylim, xticks=xticks, labelsize=fontsize)
+    if xlim:
+        ax.set_xlim(*xlim)
     if cap:
         draw_hdmap_cap(ax)
     ax.set_xlabel("Number of intersection nodes", fontsize=fontsize)
@@ -330,6 +339,8 @@ def _cpu_time_special(ax, min_val: float | None = None, band_cv_limit: float | N
         rows = [r for r in csv.DictReader(open(path)) if int(float(r["n_maps"])) >= 2]
         xs, ms, ss, ns = [], [], [], []
         for r in rows:
+            if int(float(r["node_bin"])) > MAX_BIN:
+                continue
             g, c = float(r["gen_time_s_mean"]), float(r["cpu_peak_mean"])
             if g <= 0 or c <= 0:
                 continue
@@ -444,7 +455,8 @@ def main():
         return (not only) or (fname in only)
 
     OUT.mkdir(parents=True, exist_ok=True)
-    xticks = list(range(10, 81, 10))
+    xticks = list(range(10, 71, 10))
+    XLIM = (0, 75)
 
     if want("gen_time"):
         save_single(
@@ -453,9 +465,10 @@ def main():
             "Generation time (s, log)",
             log=True,
             ylim=(1e-2, 1e4),
+            xlim=XLIM,
             cap=False,
             xticks=xticks,
-            figsize=(6.0, 6.0),
+            figsize=(6.0, 5.3),
             fontsize=16,
             min_val=1e-2,
             legend_bbox=(0.02, 1.0),
@@ -495,13 +508,14 @@ def main():
             "cpu_time.png",
             "CPU time (CPU·s, log)",
             log=True,
-            ylim=(1e-2, 1e4),
+            ylim=(1e-3, 1e4),
+            xlim=XLIM,
             cap=False,
             special=_cpu_time_special,
             xticks=xticks,
-            figsize=(6.0, 6.0),
+            figsize=(6.0, 5.3),
             fontsize=16,
-            min_val=1e-2,
+            min_val=1e-3,
             legend=False,
         )
 
@@ -511,7 +525,7 @@ def main():
         ("cpu_time_s", "CPU time (CPU·s, log)", True, (1e-3, 1e3), False, _cpu_time_special),
     ]
     panels = [p for p in panels if want(FIG[p[0]])]
-    MIN_VAL = {"gen_time_s": 1e-2, "cpu_time_s": 1e-2}
+    MIN_VAL = {"gen_time_s": 1e-2, "cpu_time_s": 1e-3}
     ncol = 2 if len(panels) <= 2 else 3
     nrow = (len(panels) + ncol - 1) // ncol
     fig, axes = plt.subplots(nrow, ncol, figsize=(8.0 * ncol, 8.0 * nrow))
@@ -527,6 +541,7 @@ def main():
         if ylim is None and not log:
             ylim = compute_ylim(metric)
         style_ax(ax, log=log, ylim=ylim, xticks=xticks, labelsize=15)
+        ax.set_xlim(*XLIM)
         if cap:
             draw_hdmap_cap(ax)
         ax.set_xlabel("Number of intersection nodes", fontsize=18)

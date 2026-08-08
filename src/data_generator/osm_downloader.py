@@ -161,15 +161,20 @@ def download_osm_cache(
     osm_dir: str | None = None,
     city_limit: int | None = None,
     city_names: list[str] | None = None,
-):
+) -> tuple[int, int, int]:
     """Download OSM road networks and cache as GeoJSON.
 
     If *city_names* is provided (e.g. from parquet), it is used directly
     instead of reading from *input_dir*.
+
+    Returns:
+        tuple[int, int, int]: (downloaded, skipped, failed) city counts.
     """
     os.makedirs(cache_dir, exist_ok=True)
     if osm_dir:
         os.makedirs(osm_dir, exist_ok=True)
+
+    downloaded = skipped = failed = 0
 
     if city_names is not None:
         city_list = city_names
@@ -179,11 +184,13 @@ def download_osm_cache(
         )
 
     if osm_dir:
-        city_list = [
+        present = {
             c
             for c in city_list
-            if not os.path.exists(os.path.join(osm_dir, f"{sanitize_city_name(c)}.geojson"))
-        ]
+            if os.path.exists(os.path.join(osm_dir, f"{sanitize_city_name(c)}.geojson"))
+        }
+        skipped += len(present)
+        city_list = [c for c in city_list if c not in present]
     if city_limit:
         city_list = city_list[:city_limit]
 
@@ -193,6 +200,7 @@ def download_osm_cache(
         cache_path = os.path.join(cache_dir, f"{safe}.geojson")
 
         if osm_dir and os.path.exists(osm_path):
+            skipped += 1
             continue
 
         if os.path.exists(cache_path):
@@ -203,9 +211,11 @@ def download_osm_cache(
                     print("moved to osm/")
                 else:
                     print("ok")
+                skipped += 1
             else:
                 print("invalid, re-downloading")
                 os.remove(cache_path)
+                failed += 1
             continue
 
         if city_names is not None:
@@ -216,11 +226,13 @@ def download_osm_cache(
                 bounds = (lon - 0.15, lat - 0.15, lon + 0.15, lat + 0.15)
             except Exception as e:
                 print(f"geocode FAILED: {e}")
+                failed += 1
                 continue
             print(f"bounds={[round(b, 3) for b in bounds]}", end=" ", flush=True)
         else:
             shp_files = [f for f in os.listdir(os.path.join(input_dir, city)) if f.endswith(".shp")]
             if not shp_files:
+                failed += 1
                 continue
             gdf_grid = gpd.read_file(os.path.join(input_dir, city, shp_files[0]))
             bounds = gdf_grid.total_bounds
@@ -233,6 +245,7 @@ def download_osm_cache(
         gdf_roads = _download_city_roads_adaptive(bounds)
         if gdf_roads is None:
             print(" -> SKIP (all tiles failed)")
+            failed += 1
             continue
 
         gdf_roads.to_file(cache_path, driver="GeoJSON")
@@ -242,8 +255,13 @@ def download_osm_cache(
             if _verify_geojson(cache_path):
                 shutil.move(cache_path, osm_path)
                 print(", verified, moved to osm/")
+                downloaded += 1
             else:
                 print(", but verification FAILED")
                 os.remove(cache_path)
+                failed += 1
         else:
             print()
+            downloaded += 1
+
+    return downloaded, skipped, failed

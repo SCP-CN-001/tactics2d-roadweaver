@@ -449,6 +449,8 @@ def build_map(
     seed: int = 0,
     *,
     map_size_m: float = 2000.0,
+    map_w: float | None = None,
+    map_h: float | None = None,
     device: str | None = None,
     vq_ckpt: str | None = None,
     tfm_ckpt: str | None = None,
@@ -458,8 +460,10 @@ def build_map(
 
     Builds an 11-dim condition (style = one-hot over ``seed % 6`` patterns,
     structural priors at the 2km defaults), runs the full pipeline and returns
-    the assembled tactics2d Map.  Mirrors the former ``render_tactics2d.build_map``
-    (now removed) so demos can swap it in directly.
+    the assembled tactics2d Map.  ``map_w``/``map_h`` override ``map_size_m``
+    per-axis so non-square maps (width != height) are supported.  Mirrors the
+    former ``render_tactics2d.build_map`` (now removed) so demos can swap it in
+    directly.
     """
     from network_generator.backbone.generator import make_generator
 
@@ -479,8 +483,8 @@ def build_map(
         gen,
         cond,
         cond[0, 6:],
-        map_w=map_size_m,
-        map_h=map_size_m,
+        map_w=map_size_m if map_w is None else map_w,
+        map_h=map_size_m if map_h is None else map_h,
         name=f"rw_{seed}",
         scenario_type="urban",
         seed=seed,

@@ -123,7 +123,10 @@ def _trim_taper_lane(lane, min_width: float = 1.5) -> None:
     if w[0] >= min_width and w[-1] >= min_width:
         return
     keep = np.where(w >= min_width)[0]
-    if len(keep) == 0:
+    if len(keep) < 2:
+        # Only one (or zero) sample points survive the width cutoff; every
+        # trim branch below would slice down to a degenerate 1-point
+        # LineString, which shapely rejects.  Leave the lane as-is instead.
         return
     i0 = int(keep[0])
     i1 = int(keep[-1])

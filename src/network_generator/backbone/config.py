@@ -32,8 +32,8 @@ class BackboneConfig:
 
     # ── Data paths ─────────────────────────────────────────────────
     # Path to the training / validation split Parquet files.
-    train_split_path: str = "data/urban_prior_clean/splits/train.parquet"
-    val_split_path: str = "data/urban_prior_clean/splits/val.parquet"
+    train_split_path: str = "data/urban_prior/2km/splits/train.parquet"
+    val_split_path: str = "data/urban_prior/2km/splits/val.parquet"
 
     # Maximum number of skeleton nodes per sample during training.
     # Samples exceeding this limit are filtered out.

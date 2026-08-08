@@ -13,8 +13,8 @@ scalable closed-loop evaluation":
 * Fig B — closed-loop driving: an ego vehicle (kinematic bicycle + pure-pursuit
   follower) drives a long planned route; trajectory overlay + lateral / speed /
   steering panels.
-* Fig C — scalability summary: routing success rate and route length across
-  generated maps.
+* Fig C — scalability summary: routing success rate, route length, and routing
+  time (graph build + per-route Dijkstra) across generated maps.
 
 Usage:
     conda activate road-weaver
@@ -26,6 +26,7 @@ from __future__ import annotations
 import csv
 import os
 import sys
+import time
 from pathlib import Path
 
 import matplotlib
@@ -71,31 +72,39 @@ class CachedRouter:
 
     ``Router.plan`` rebuilds the lane graph on every call; for batch planning
     (long-route sampling, scalability sweep) that is wasteful, so this class
-    builds the graph once and runs Dijkstra against it.
+    builds the graph once and runs Dijkstra against it. Graph build and each
+    per-route plan are timed for scalability reporting.
     """
 
     def __init__(self, hd):
         self.hd = hd
+        t0 = time.perf_counter()
         self.rg = GraphBuilder(
             include_neighbors=True, lane_change_penalty=0.0, cost_mode="distance"
         ).build(hd)
+        self.build_time_s = time.perf_counter() - t0
+        self.plan_times_s = []  # one entry per plan() call (success or not)
 
     def plan(self, start, goal):
-        sl = find_nearest_lane(self.hd, start)
-        gl = find_nearest_lane(self.hd, goal)
-        if sl is None or gl is None:
-            return _Route([], None, 0.0)
-        if sl not in self.rg.lane_id_to_index or gl not in self.rg.lane_id_to_index:
-            return _Route([], None, 0.0)
-        si, gi = self.rg.lane_id_to_index[sl], self.rg.lane_id_to_index[gl]
-        path_idx, cost, _ = AlgorithmAdapter.dijkstra(self.rg, si, gi)
-        if not path_idx:
-            return _Route([], None, 0.0)
-        lane_ids = [self.rg.index_to_lane_id[idx] for idx in path_idx]
-        segs = [get_lane_centerline(self.hd.lanes[lid]) for lid in lane_ids]
-        segs = [s for s in segs if s is not None]
-        path = np.concatenate(segs) if segs else None
-        return _Route(lane_ids, path, float(cost))
+        t0 = time.perf_counter()
+        try:
+            sl = find_nearest_lane(self.hd, start)
+            gl = find_nearest_lane(self.hd, goal)
+            if sl is None or gl is None:
+                return _Route([], None, 0.0)
+            if sl not in self.rg.lane_id_to_index or gl not in self.rg.lane_id_to_index:
+                return _Route([], None, 0.0)
+            si, gi = self.rg.lane_id_to_index[sl], self.rg.lane_id_to_index[gl]
+            path_idx, cost, _ = AlgorithmAdapter.dijkstra(self.rg, si, gi)
+            if not path_idx:
+                return _Route([], None, 0.0)
+            lane_ids = [self.rg.index_to_lane_id[idx] for idx in path_idx]
+            segs = [get_lane_centerline(self.hd.lanes[lid]) for lid in lane_ids]
+            segs = [s for s in segs if s is not None]
+            path = np.concatenate(segs) if segs else None
+            return _Route(lane_ids, path, float(cost))
+        finally:
+            self.plan_times_s.append(time.perf_counter() - t0)
 
 
 # ── Rendering with the official tactics2d renderer ────────────────────────
@@ -433,11 +442,18 @@ def fig_scalability(n_maps=6, seeds=None, out=None):
     if seeds is None:
         seeds = list(range(100, 100 + n_maps))
     rows = []
+    skipped = []
     rng = np.random.default_rng(3)
     for seed in seeds:
-        hd = build_map(seed=seed)
+        try:
+            hd = build_map(seed=seed)
+        except Exception as e:  # a single bad map must not kill the whole sweep
+            skipped.append(seed)
+            print(f"[demo] figC seed {seed}: build FAILED ({type(e).__name__}: {e})", flush=True)
+            continue
         lanes = [l for l in hd.lanes if l.startswith("e")]
         router = CachedRouter(hd)
+        attempts = 0
         ok = 0
         lens = []
         for _ in range(10):
@@ -446,23 +462,34 @@ def fig_scalability(n_maps=6, seeds=None, out=None):
             clb = get_lane_centerline(hd.lanes[b])
             if cla is None or clb is None:
                 continue
+            attempts += 1
             route = router.plan(cla[0], clb[len(clb) // 2])
             if route.path is not None and len(route.path) >= 3 and not route.is_empty:
                 ok += 1
                 lens.append(route.total_cost)
+        mean_plan_ms = float(np.mean(router.plan_times_s)) * 1e3 if router.plan_times_s else 0.0
         rows.append(
             {
                 "seed": seed,
                 "lanes": len(hd.lanes),
                 "junctions": len(hd.junctions or {}),
                 "routes_ok": ok,
-                "routes_total": 10,
-                "success": ok / 10.0,
+                "routes_total": attempts,
+                "success": ok / attempts if attempts else 0.0,
                 "mean_len_m": float(np.mean(lens)) if lens else 0.0,
+                "build_ms": router.build_time_s * 1e3,
+                "mean_plan_ms": mean_plan_ms,
             }
         )
-        print(f"[demo] figC seed {seed}: success {ok}/10", flush=True)
+        print(
+            f"[demo] figC seed {seed}: success {ok}/{attempts}  "
+            f"(build {router.build_time_s * 1e3:.1f} ms, mean plan {mean_plan_ms:.2f} ms)",
+            flush=True,
+        )
 
+    if not rows:
+        print("[demo] figC: no maps built, nothing to report")
+        return []
     csv_path = OUT / "stats.csv"
     with open(csv_path, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
@@ -470,7 +497,23 @@ def fig_scalability(n_maps=6, seeds=None, out=None):
         w.writerows(rows)
     print(f"[demo] stats -> {csv_path}")
 
-    fig, axes = plt.subplots(1, 2, figsize=(12, 4.5))
+    agg = {
+        "success": float(np.mean([r["success"] for r in rows])),
+        "mean_len_m": float(np.mean([r["mean_len_m"] for r in rows])),
+        "build_ms": float(np.mean([r["build_ms"] for r in rows])),
+        "plan_ms": float(np.mean([r["mean_plan_ms"] for r in rows])),
+    }
+    total_routes = sum(r["routes_total"] for r in rows)
+    skip_note = f", skipped {len(skipped)} seeds {skipped}" if skipped else ""
+    print(
+        f"[demo] figC aggregate (n={len(rows)} maps, {total_routes} routes{skip_note}): "
+        f"mean success {agg['success'] * 100:.1f}%, "
+        f"mean length {agg['mean_len_m']:.0f} m, "
+        f"mean build {agg['build_ms']:.1f} ms, "
+        f"mean plan {agg['plan_ms']:.2f} ms"
+    )
+
+    fig, axes = plt.subplots(1, 3, figsize=(16, 4.5))
     axes[0].bar([r["seed"] for r in rows], [r["success"] * 100 for r in rows], color="#2980b9")
     axes[0].axhline(90, color="#27ae60", ls="--", lw=1.2, label="target 90%")
     axes[0].set_ylim(0, 105)
@@ -482,6 +525,10 @@ def fig_scalability(n_maps=6, seeds=None, out=None):
     axes[1].set_ylabel("mean route length (m)")
     axes[1].set_xlabel("map seed")
     axes[1].set_title("Route length")
+    axes[2].bar([r["seed"] for r in rows], [r["mean_plan_ms"] for r in rows], color="#8e44ad")
+    axes[2].set_ylabel("mean routing time (ms)")
+    axes[2].set_xlabel("map seed")
+    axes[2].set_title("Routing time (cached graph)")
     fig.suptitle(
         "Scalable closed-loop evaluation: batch route planning on generated maps",
         fontsize=13,

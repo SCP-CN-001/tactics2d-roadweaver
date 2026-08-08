@@ -36,7 +36,7 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description="Build Urban Structural Prior Dataset (Parquet output)"
     )
-    parser.add_argument("--crhd-root", default="data/crhd_2km_context_600x600")
+    parser.add_argument("--crhd-root", default="data/crhd_2km")
     parser.add_argument("--graph-root", default="data/osm")
     parser.add_argument("--output", default="data/urban_prior/urban_prior.parquet")
     parser.add_argument("--context-size-m", type=float, default=2000.0)
